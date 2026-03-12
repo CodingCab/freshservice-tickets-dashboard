@@ -3,11 +3,12 @@
  */
 
 // API endpoint — served by Laravel
-const API_URL = '/www/tickets/api/tickets';
+// Derive API URL from current page location so it works behind any prefix
+const API_URL = window.location.pathname.replace(/\/$/, '') + '/api/tickets';
 const STATUS_MAP = { 2: 'Open', 3: 'Pending', 4: 'Resolved', 5: 'Closed', 9: 'Adam', 10: 'Notification' };
 const PRIORITY_MAP = { 1: 'Low', 2: 'Medium', 3: 'High', 4: 'Urgent' };
 
-let tickets = [];
+let tickets = [];       // Each entry: { ...freshservice fields, _internal: { ticket_file, next_action, summary } }
 let currentFilter = 'active';
 let currentSort = 'category';
 let sortDir = 1;
@@ -19,7 +20,7 @@ function renderApp() {
         <div class="header">
             <h1>FreshService Tickets</h1>
             <button class="refresh-btn" onclick="loadTickets()">↻ Refresh</button>
-            <a href="/www/tickets/api/tickets" target="_blank" class="json-link">JSON</a>
+            <a href="${API_URL}" target="_blank" class="json-link">JSON</a>
             <a href="/www/freshservice-tickets-db.json" target="_blank" class="json-link">DB File</a>
             <span class="last-updated" id="lastUpdated"></span>
         </div>
@@ -46,6 +47,9 @@ function renderApp() {
                     <th onclick="sortBy('requester_name')">Requester <span class="sort-arrow" id="sort-requester_name"></span></th>
                     <th onclick="sortBy('created_at')">Created <span class="sort-arrow" id="sort-created_at"></span></th>
                     <th onclick="sortBy('updated_at')">Updated <span class="sort-arrow" id="sort-updated_at"></span></th>
+                    <th>Summary</th>
+                    <th>Next Action</th>
+                    <th>Ticket File</th>
                 </tr>
             </thead>
             <tbody id="ticketBody"></tbody>
@@ -59,13 +63,17 @@ async function loadTickets() {
     try {
         const resp = await fetch(API_URL + '?t=' + Date.now());
         const db = await resp.json();
-        tickets = Object.values(db.tickets || {}).map(t => t.freshservice);
+        tickets = Object.values(db.tickets || {}).map(t => {
+            const fs = t.freshservice || {};
+            fs._internal = t.internal || {};
+            return fs;
+        });
         document.getElementById('lastUpdated').textContent = 'Last synced: ' + (db.last_synced || 'unknown');
         renderStats();
         renderTable();
     } catch (e) {
         document.getElementById('ticketBody').innerHTML =
-            '<tr><td colspan="8" class="empty">Failed to load tickets: ' + e.message + '</td></tr>';
+            '<tr><td colspan="11" class="empty">Failed to load tickets: ' + e.message + '</td></tr>';
     }
 }
 
@@ -123,7 +131,7 @@ function renderTable() {
 
     if (!filtered.length) {
         document.getElementById('ticketBody').innerHTML =
-            '<tr><td colspan="8" class="empty">No tickets found</td></tr>';
+            '<tr><td colspan="11" class="empty">No tickets found</td></tr>';
         return;
     }
 
@@ -143,6 +151,9 @@ function renderTable() {
             <td class="requester" title="${(t.requester_name || '').replace(/"/g, '&quot;')}">${t.requester_name || ''}</td>
             <td class="timestamp">${created}</td>
             <td class="timestamp">${updated}</td>
+            <td class="internal-summary" title="${(t._internal.summary || '').replace(/"/g, '&quot;')}">${t._internal.summary || ''}</td>
+            <td class="internal-action">${t._internal.next_action || ''}</td>
+            <td>${t._internal.ticket_file ? '<a href="' + t._internal.ticket_file + '" target="_blank">View</a>' : ''}</td>
         </tr>`;
     }).join('');
 }
