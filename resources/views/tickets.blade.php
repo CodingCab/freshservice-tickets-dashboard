@@ -11,6 +11,7 @@
 <body>
     <div id="app"></div>
     {{-- Hand-written SPA shell (Tickets + Agents tabs). Loads after Vite bundle so window.taskListsTabHTML / mountTaskListsApp are available during renderApp(). --}}
-    <script src="{{ asset('js/app.js') }}?v={{ filemtime(public_path('js/app.js')) }}"></script>
+    {{-- defer so it runs after the @vite module bundle (which exposes window.taskListsTabHTML / mountTaskListsApp). --}}
+    <script src="{{ asset('js/app.js') }}?v={{ filemtime(public_path('js/app.js')) }}" defer></script>
 </body>
 </html>
