@@ -5,6 +5,7 @@
 const BASE_URL = window.location.pathname.replace(/\/$/, '');
 const TICKETS_API = BASE_URL + '/api/tickets';
 const AGENTS_API = BASE_URL + '/api/agents';
+const TASK_LISTS_JSON = '/www/task-lists.json';
 
 const STATUS_MAP = { 2: 'Open', 3: 'Pending', 4: 'Resolved', 5: 'Closed', 9: 'Adam', 10: 'Notification' };
 const PRIORITY_MAP = { 1: 'Low', 2: 'Medium', 3: 'High', 4: 'Urgent' };
@@ -92,6 +93,7 @@ function renderApp() {
         <div class="page-tabs">
             <button class="page-tab active" data-page="tickets" onclick="switchTab('tickets')">Tickets</button>
             <button class="page-tab" data-page="agents" onclick="switchTab('agents')">Agents</button>
+            <button class="page-tab" data-page="task-lists" onclick="switchTab('task-lists')">Task Lists</button>
         </div>
 
         <div id="tickets-tab" class="tab-page">
@@ -157,6 +159,16 @@ function renderApp() {
             </div>
         </div>
 
+        <div id="task-lists-tab" class="tab-page" style="display:none;">
+            <div class="header">
+                <h1>Task Lists</h1>
+                <button class="refresh-btn" onclick="loadTaskLists()">&#x21bb; Refresh</button>
+                <a href="${TASK_LISTS_JSON}" target="_blank" class="json-link">JSON</a>
+                <span class="last-updated" id="taskListsUpdated"></span>
+            </div>
+            <div id="taskListsBody" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;padding:8px;"></div>
+        </div>
+
         <div class="modal" id="agentModal">
             <div class="modal-content">
                 <div class="modal-header">
@@ -169,7 +181,7 @@ function renderApp() {
                 </div>
                 <div class="modal-body">
                     <pre id="modalPrompt" class="mtab-content active"></pre>
-                    <pre id="modalOutput" class="mtab-content"></pre>
+                    <div id="modalOutput" class="mtab-content output-formatted"></div>
                 </div>
             </div>
         </div>
@@ -202,8 +214,43 @@ function switchTab(tab, updateHash = true) {
     );
     document.getElementById('tickets-tab').style.display = tab === 'tickets' ? '' : 'none';
     document.getElementById('agents-tab').style.display = tab === 'agents' ? '' : 'none';
+    document.getElementById('task-lists-tab').style.display = tab === 'task-lists' ? '' : 'none';
     if (tab === 'agents' && agentTasks.length === 0) loadAgents();
+    if (tab === 'task-lists') loadTaskLists();
     if (updateHash) window.location.hash = tab === 'tickets' ? '' : tab;
+}
+
+// ─── Task Lists ─────────────────────────────────────────────────
+
+async function loadTaskLists() {
+    const body = document.getElementById('taskListsBody');
+    try {
+        const resp = await fetch(TASK_LISTS_JSON + '?t=' + Date.now());
+        const data = await resp.json();
+        document.getElementById('taskListsUpdated').textContent = 'Generated: ' + (data.generated_at || '');
+        body.innerHTML = (data.task_lists || []).map(tl => {
+            const total = (tl.sections || []).reduce((s, x) => s + (x.count || 0), 0);
+            const rows = (tl.sections || []).map(s => {
+                const has = (s.count || 0) > 0;
+                return `<div style="display:flex;justify-content:space-between;align-items:center;background:#21262d;border:1px solid #30363d;border-radius:6px;padding:5px 9px;font-size:12px;margin-bottom:4px;">
+                    <span style="color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;">${escapeHtml(s.name)}</span>
+                    <span style="background:${has ? '#1f6feb' : '#30363d'};color:${has ? '#fff' : '#8b949e'};padding:1px 7px;border-radius:10px;font-size:11px;min-width:22px;text-align:center;">${s.count || 0}</span>
+                </div>`;
+            }).join('');
+            return `<div style="background:linear-gradient(180deg,#1c2128,#161b22);border:1px solid #30363d;border-radius:10px;padding:12px;">
+                <div style="font-size:13px;font-weight:600;color:#58a6ff;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #30363d;word-break:break-word;">${escapeHtml(tl.file)}</div>
+                ${rows}
+                <div style="font-size:11px;color:#6e7681;margin-top:6px;">${(tl.sections || []).length} sections &middot; ${total} items</div>
+            </div>`;
+        }).join('');
+        if (!body.innerHTML) body.innerHTML = '<div class="empty">No task lists.</div>';
+    } catch (e) {
+        body.innerHTML = '<div class="empty" style="color:#f85149;">Failed to load task-lists.json: ' + e.message + '</div>';
+    }
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 // ─── Tickets data fetching ──────────────────────────────────────
@@ -508,13 +555,63 @@ function switchModalTab(tab) {
     if (tab === 'output' && currentAgentId) loadAgentOutput(currentAgentId);
 }
 
+function formatAgentOutput(raw) {
+    const lines = raw.split('\n').filter(l => l.trim());
+    const parts = [];
+
+    for (const line of lines) {
+        let obj;
+        try { obj = JSON.parse(line); } catch { continue; }
+
+        if (obj.type === 'system' && obj.subtype === 'init') continue;
+        if (obj.type === 'system' && obj.subtype === 'result') {
+            const r = obj.result || '';
+            parts.push(`<div class="out-result"><strong>Result:</strong> ${esc(typeof r === 'string' ? r : JSON.stringify(r))}</div>`);
+            if (obj.cost_usd) parts.push(`<div class="out-meta">Cost: $${obj.cost_usd.toFixed(2)} | Turns: ${obj.num_turns || '-'} | Duration: ${obj.duration_ms ? formatDurationSec(Math.round(obj.duration_ms / 1000)) : '-'}</div>`);
+            continue;
+        }
+        if (obj.type === 'system') continue;
+
+        if (obj.type === 'assistant' && obj.message?.content) {
+            for (const block of obj.message.content) {
+                if (block.type === 'thinking') continue;
+                if (block.type === 'text' && block.text) {
+                    parts.push(`<div class="out-text">${esc(block.text)}</div>`);
+                }
+                if (block.type === 'tool_use') {
+                    const args = block.input ? JSON.stringify(block.input) : '';
+                    const shortArgs = args.length > 200 ? args.substring(0, 197) + '...' : args;
+                    parts.push(`<div class="out-tool"><span class="out-tool-name">${esc(block.name)}</span> <span class="out-tool-args">${esc(shortArgs)}</span></div>`);
+                }
+            }
+            continue;
+        }
+
+        if (obj.type === 'user' && obj.message?.content) {
+            for (const block of obj.message.content) {
+                if (block.type === 'tool_result') {
+                    const content = typeof block.content === 'string' ? block.content : (Array.isArray(block.content) ? block.content.map(c => c.text || '').join('') : JSON.stringify(block.content));
+                    const short = content.length > 500 ? content.substring(0, 497) + '...' : content;
+                    const isErr = block.is_error;
+                    parts.push(`<div class="out-tool-result ${isErr ? 'out-error' : ''}">${esc(short)}</div>`);
+                }
+            }
+            continue;
+        }
+    }
+
+    return parts.length ? parts.join('') : '<span style="color:#484f58">(no meaningful output)</span>';
+}
+
 async function loadAgentOutput(taskId) {
     const el = document.getElementById('modalOutput');
-    if (!el.textContent.trim()) el.innerHTML = '<span style="color:#484f58">Loading output...</span>';
+    if (!el.innerHTML.trim() || el.querySelector('[data-loading]')) el.innerHTML = '<span style="color:#484f58" data-loading>Loading output...</span>';
     try {
         const resp = await fetch(BASE_URL + '/api/agents/' + encodeURIComponent(taskId) + '/output');
         const data = await resp.json();
-        if (data.success && data.content) el.textContent = data.content;
+        if (data.success && data.content) {
+            el.innerHTML = formatAgentOutput(data.content);
+        }
         else if (data.status === 'running') el.innerHTML = '<span style="color:#484f58">Task is running. Output will stream here...</span>';
         else el.textContent = '(no output recorded)';
         el.scrollTop = el.scrollHeight;
@@ -569,11 +666,12 @@ function agentSortBy(col) {
 
 renderApp();
 
+const VALID_TABS = ['tickets', 'agents', 'task-lists'];
 const initialTab = window.location.hash.replace('#', '') || 'tickets';
-if (['tickets', 'agents'].includes(initialTab)) switchTab(initialTab, false);
+if (VALID_TABS.includes(initialTab)) switchTab(initialTab, false);
 window.addEventListener('hashchange', () => {
     const tab = window.location.hash.replace('#', '') || 'tickets';
-    if (['tickets', 'agents'].includes(tab)) switchTab(tab, false);
+    if (VALID_TABS.includes(tab)) switchTab(tab, false);
 });
 
 loadTickets();
