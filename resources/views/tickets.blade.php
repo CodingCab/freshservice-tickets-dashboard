@@ -5,9 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FreshService Tickets</title>
     <link rel="stylesheet" href="{{ asset('css/app.css') }}?v={{ filemtime(public_path('css/app.css')) }}">
+    {{-- Vite-built Vue SPA: components in resources/js/components/*.vue, registered globally on a single Vue app. --}}
+    @vite('resources/js/app.js')
 </head>
 <body>
     <div id="app"></div>
-    <script src="{{ asset('js/app.js') }}?v={{ filemtime(public_path('js/app.js')) }}"></script>
+    {{-- Hand-written SPA shell (Tickets + Agents tabs). Loads after Vite bundle so window.taskListsTabHTML / mountTaskListsApp are available during renderApp(). --}}
+    {{-- defer so it runs after the @vite module bundle (which exposes window.taskListsTabHTML / mountTaskListsApp). --}}
+    <script src="{{ asset('js/app.js') }}?v={{ filemtime(public_path('js/app.js')) }}" defer></script>
 </body>
 </html>

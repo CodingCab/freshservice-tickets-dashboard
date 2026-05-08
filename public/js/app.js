@@ -5,6 +5,8 @@
 const BASE_URL = window.location.pathname.replace(/\/$/, '');
 const TICKETS_API = BASE_URL + '/api/tickets';
 const AGENTS_API = BASE_URL + '/api/agents';
+// window.taskListsTabHTML / window.loadTaskLists / window.mountTaskListsApp
+// are provided by the Vite-built Vue bundle (resources/js/app.js).
 
 const STATUS_MAP = { 2: 'Open', 3: 'Pending', 4: 'Resolved', 5: 'Closed', 9: 'Adam', 10: 'Notification' };
 const PRIORITY_MAP = { 1: 'Low', 2: 'Medium', 3: 'High', 4: 'Urgent' };
@@ -92,6 +94,7 @@ function renderApp() {
         <div class="page-tabs">
             <button class="page-tab active" data-page="tickets" onclick="switchTab('tickets')">Tickets</button>
             <button class="page-tab" data-page="agents" onclick="switchTab('agents')">Agents</button>
+            <button class="page-tab" data-page="task-lists" onclick="switchTab('task-lists')">Task Lists</button>
         </div>
 
         <div id="tickets-tab" class="tab-page">
@@ -157,6 +160,8 @@ function renderApp() {
             </div>
         </div>
 
+        ${taskListsTabHTML()}
+
         <div class="modal" id="agentModal">
             <div class="modal-content">
                 <div class="modal-header">
@@ -169,7 +174,7 @@ function renderApp() {
                 </div>
                 <div class="modal-body">
                     <pre id="modalPrompt" class="mtab-content active"></pre>
-                    <pre id="modalOutput" class="mtab-content"></pre>
+                    <div id="modalOutput" class="mtab-content output-formatted"></div>
                 </div>
             </div>
         </div>
@@ -202,7 +207,9 @@ function switchTab(tab, updateHash = true) {
     );
     document.getElementById('tickets-tab').style.display = tab === 'tickets' ? '' : 'none';
     document.getElementById('agents-tab').style.display = tab === 'agents' ? '' : 'none';
+    document.getElementById('task-lists-tab').style.display = tab === 'task-lists' ? '' : 'none';
     if (tab === 'agents' && agentTasks.length === 0) loadAgents();
+    if (tab === 'task-lists') loadTaskLists();
     if (updateHash) window.location.hash = tab === 'tickets' ? '' : tab;
 }
 
@@ -508,13 +515,63 @@ function switchModalTab(tab) {
     if (tab === 'output' && currentAgentId) loadAgentOutput(currentAgentId);
 }
 
+function formatAgentOutput(raw) {
+    const lines = raw.split('\n').filter(l => l.trim());
+    const parts = [];
+
+    for (const line of lines) {
+        let obj;
+        try { obj = JSON.parse(line); } catch { continue; }
+
+        if (obj.type === 'system' && obj.subtype === 'init') continue;
+        if (obj.type === 'system' && obj.subtype === 'result') {
+            const r = obj.result || '';
+            parts.push(`<div class="out-result"><strong>Result:</strong> ${esc(typeof r === 'string' ? r : JSON.stringify(r))}</div>`);
+            if (obj.cost_usd) parts.push(`<div class="out-meta">Cost: $${obj.cost_usd.toFixed(2)} | Turns: ${obj.num_turns || '-'} | Duration: ${obj.duration_ms ? formatDurationSec(Math.round(obj.duration_ms / 1000)) : '-'}</div>`);
+            continue;
+        }
+        if (obj.type === 'system') continue;
+
+        if (obj.type === 'assistant' && obj.message?.content) {
+            for (const block of obj.message.content) {
+                if (block.type === 'thinking') continue;
+                if (block.type === 'text' && block.text) {
+                    parts.push(`<div class="out-text">${esc(block.text)}</div>`);
+                }
+                if (block.type === 'tool_use') {
+                    const args = block.input ? JSON.stringify(block.input) : '';
+                    const shortArgs = args.length > 200 ? args.substring(0, 197) + '...' : args;
+                    parts.push(`<div class="out-tool"><span class="out-tool-name">${esc(block.name)}</span> <span class="out-tool-args">${esc(shortArgs)}</span></div>`);
+                }
+            }
+            continue;
+        }
+
+        if (obj.type === 'user' && obj.message?.content) {
+            for (const block of obj.message.content) {
+                if (block.type === 'tool_result') {
+                    const content = typeof block.content === 'string' ? block.content : (Array.isArray(block.content) ? block.content.map(c => c.text || '').join('') : JSON.stringify(block.content));
+                    const short = content.length > 500 ? content.substring(0, 497) + '...' : content;
+                    const isErr = block.is_error;
+                    parts.push(`<div class="out-tool-result ${isErr ? 'out-error' : ''}">${esc(short)}</div>`);
+                }
+            }
+            continue;
+        }
+    }
+
+    return parts.length ? parts.join('') : '<span style="color:#484f58">(no meaningful output)</span>';
+}
+
 async function loadAgentOutput(taskId) {
     const el = document.getElementById('modalOutput');
-    if (!el.textContent.trim()) el.innerHTML = '<span style="color:#484f58">Loading output...</span>';
+    if (!el.innerHTML.trim() || el.querySelector('[data-loading]')) el.innerHTML = '<span style="color:#484f58" data-loading>Loading output...</span>';
     try {
         const resp = await fetch(BASE_URL + '/api/agents/' + encodeURIComponent(taskId) + '/output');
         const data = await resp.json();
-        if (data.success && data.content) el.textContent = data.content;
+        if (data.success && data.content) {
+            el.innerHTML = formatAgentOutput(data.content);
+        }
         else if (data.status === 'running') el.innerHTML = '<span style="color:#484f58">Task is running. Output will stream here...</span>';
         else el.textContent = '(no output recorded)';
         el.scrollTop = el.scrollHeight;
@@ -569,11 +626,12 @@ function agentSortBy(col) {
 
 renderApp();
 
+const VALID_TABS = ['tickets', 'agents', 'task-lists'];
 const initialTab = window.location.hash.replace('#', '') || 'tickets';
-if (['tickets', 'agents'].includes(initialTab)) switchTab(initialTab, false);
+if (VALID_TABS.includes(initialTab)) switchTab(initialTab, false);
 window.addEventListener('hashchange', () => {
     const tab = window.location.hash.replace('#', '') || 'tickets';
-    if (['tickets', 'agents'].includes(tab)) switchTab(tab, false);
+    if (VALID_TABS.includes(tab)) switchTab(tab, false);
 });
 
 loadTickets();
