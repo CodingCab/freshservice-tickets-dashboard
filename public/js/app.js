@@ -5,7 +5,7 @@
 const BASE_URL = window.location.pathname.replace(/\/$/, '');
 const TICKETS_API = BASE_URL + '/api/tickets';
 const AGENTS_API = BASE_URL + '/api/agents';
-const TASK_LISTS_JSON = '/www/task-lists.json';
+// TASK_LISTS_JSON, taskListsTabHTML(), loadTaskLists() are provided by task-lists-view.js
 
 const STATUS_MAP = { 2: 'Open', 3: 'Pending', 4: 'Resolved', 5: 'Closed', 9: 'Adam', 10: 'Notification' };
 const PRIORITY_MAP = { 1: 'Low', 2: 'Medium', 3: 'High', 4: 'Urgent' };
@@ -159,15 +159,7 @@ function renderApp() {
             </div>
         </div>
 
-        <div id="task-lists-tab" class="tab-page" style="display:none;">
-            <div class="header">
-                <h1>Task Lists</h1>
-                <button class="refresh-btn" onclick="loadTaskLists()">&#x21bb; Refresh</button>
-                <a href="${TASK_LISTS_JSON}" target="_blank" class="json-link">JSON</a>
-                <span class="last-updated" id="taskListsUpdated"></span>
-            </div>
-            <div id="taskListsBody" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;padding:8px;"></div>
-        </div>
+        ${taskListsTabHTML()}
 
         <div class="modal" id="agentModal">
             <div class="modal-content">
@@ -218,39 +210,6 @@ function switchTab(tab, updateHash = true) {
     if (tab === 'agents' && agentTasks.length === 0) loadAgents();
     if (tab === 'task-lists') loadTaskLists();
     if (updateHash) window.location.hash = tab === 'tickets' ? '' : tab;
-}
-
-// ─── Task Lists ─────────────────────────────────────────────────
-
-async function loadTaskLists() {
-    const body = document.getElementById('taskListsBody');
-    try {
-        const resp = await fetch(TASK_LISTS_JSON + '?t=' + Date.now());
-        const data = await resp.json();
-        document.getElementById('taskListsUpdated').textContent = 'Generated: ' + (data.generated_at || '');
-        body.innerHTML = (data.task_lists || []).map(tl => {
-            const total = (tl.sections || []).reduce((s, x) => s + (x.count || 0), 0);
-            const rows = (tl.sections || []).map(s => {
-                const has = (s.count || 0) > 0;
-                return `<div style="display:flex;justify-content:space-between;align-items:center;background:#21262d;border:1px solid #30363d;border-radius:6px;padding:5px 9px;font-size:12px;margin-bottom:4px;">
-                    <span style="color:#c9d1d9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;">${escapeHtml(s.name)}</span>
-                    <span style="background:${has ? '#1f6feb' : '#30363d'};color:${has ? '#fff' : '#8b949e'};padding:1px 7px;border-radius:10px;font-size:11px;min-width:22px;text-align:center;">${s.count || 0}</span>
-                </div>`;
-            }).join('');
-            return `<div style="background:linear-gradient(180deg,#1c2128,#161b22);border:1px solid #30363d;border-radius:10px;padding:12px;">
-                <div style="font-size:13px;font-weight:600;color:#58a6ff;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #30363d;word-break:break-word;">${escapeHtml(tl.file)}</div>
-                ${rows}
-                <div style="font-size:11px;color:#6e7681;margin-top:6px;">${(tl.sections || []).length} sections &middot; ${total} items</div>
-            </div>`;
-        }).join('');
-        if (!body.innerHTML) body.innerHTML = '<div class="empty">No task lists.</div>';
-    } catch (e) {
-        body.innerHTML = '<div class="empty" style="color:#f85149;">Failed to load task-lists.json: ' + e.message + '</div>';
-    }
-}
-
-function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 // ─── Tickets data fetching ──────────────────────────────────────
