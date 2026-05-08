@@ -1,14 +1,16 @@
 // @ts-check
 const { test, expect } = require('@playwright/test');
 
-const BASE_URL = process.env.TICKETS_URL || 'https://webde.larachat.ai/www/tickets/';
+// When using playwright.config.cjs, baseURL is set there.
+// Falls back to env var or localhost for standalone runs.
+const BASE_URL = process.env.TICKETS_URL || '/';
 
 test.describe('FreshService Tickets Dashboard', () => {
 
     test('page loads and displays title', async ({ page }) => {
         await page.goto(BASE_URL);
         await expect(page).toHaveTitle('FreshService Tickets');
-        await expect(page.locator('h1')).toHaveText('FreshService Tickets');
+        await expect(page.locator('#tickets-tab h1')).toHaveText('FreshService Tickets');
     });
 
     test('tickets table is populated with data', async ({ page }) => {
@@ -117,8 +119,34 @@ test.describe('FreshService Tickets Dashboard', () => {
 
     test('JSON and DB File links are present', async ({ page }) => {
         await page.goto(BASE_URL);
-        
-        await expect(page.locator('a.json-link:has-text("JSON")')).toBeVisible();
-        await expect(page.locator('a.json-link:has-text("DB File")')).toBeVisible();
+
+        await expect(page.locator('#tickets-tab a.json-link:has-text("JSON")')).toBeVisible();
+        await expect(page.locator('#tickets-tab a.json-link:has-text("DB File")')).toBeVisible();
+    });
+
+    test('table has custom internal field columns', async ({ page }) => {
+        await page.goto(BASE_URL);
+        await expect(page.locator('#ticketBody tr').first()).toBeVisible({ timeout: 10000 });
+
+        // Verify the new column headers exist
+        await expect(page.locator('th:has-text("Summary")')).toBeVisible();
+        await expect(page.locator('th:has-text("Next Action")')).toBeVisible();
+        await expect(page.locator('th:has-text("Ticket File")')).toBeVisible();
+    });
+
+    test('API returns internal fields for tickets', async ({ page }) => {
+        const response = await page.request.get(BASE_URL + 'api/tickets');
+        expect(response.ok()).toBeTruthy();
+
+        const data = await response.json();
+        const tickets = Object.values(data.tickets || {});
+        expect(tickets.length).toBeGreaterThan(0);
+
+        // Each ticket should have an internal sub-object
+        const firstTicket = tickets[0];
+        expect(firstTicket).toHaveProperty('internal');
+        expect(firstTicket.internal).toHaveProperty('ticket_file');
+        expect(firstTicket.internal).toHaveProperty('next_action');
+        expect(firstTicket.internal).toHaveProperty('summary');
     });
 });
