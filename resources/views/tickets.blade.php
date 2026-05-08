@@ -5,11 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FreshService Tickets</title>
     <link rel="stylesheet" href="{{ asset('css/app.css') }}?v={{ filemtime(public_path('css/app.css')) }}">
+    {{-- Vite-built Vue bundle for the Task Lists tab. Vue is bundled from local node_modules. --}}
+    @vite('resources/js/task-lists.js')
 </head>
 <body>
     <div id="app"></div>
-    <script src="https://unpkg.com/vue@3.5.13/dist/vue.global.prod.js"></script>
-    <script src="{{ asset('js/task-lists-view.js') }}?v={{ filemtime(public_path('js/task-lists-view.js')) }}"></script>
+    {{-- Hand-written SPA shell (Tickets + Agents tabs). Loads after Vite bundle so window.taskListsTabHTML is available during renderApp(). --}}
     <script src="{{ asset('js/app.js') }}?v={{ filemtime(public_path('js/app.js')) }}"></script>
 </body>
 </html>
