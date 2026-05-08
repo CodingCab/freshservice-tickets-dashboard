@@ -5,7 +5,8 @@
 const BASE_URL = window.location.pathname.replace(/\/$/, '');
 const TICKETS_API = BASE_URL + '/api/tickets';
 const AGENTS_API = BASE_URL + '/api/agents';
-// TASK_LISTS_JSON, taskListsTabHTML(), loadTaskLists() are provided by task-lists-view.js
+// window.taskListsTabHTML / window.loadTaskLists / window.mountTaskListsApp
+// are provided by the Vite-built Vue bundle (resources/js/app.js).
 
 const STATUS_MAP = { 2: 'Open', 3: 'Pending', 4: 'Resolved', 5: 'Closed', 9: 'Adam', 10: 'Notification' };
 const PRIORITY_MAP = { 1: 'Low', 2: 'Medium', 3: 'High', 4: 'Urgent' };
