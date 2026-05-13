@@ -9,14 +9,22 @@
  * its DOM imperatively into #app and includes a placeholder element
  * <div id="task-lists-app"><task-lists /></div> for the Vue side. It calls
  * window.mountTaskListsApp() once that placeholder is in the DOM.
+ *
+ * The ticket detail viewer (`TicketDetail.vue`) mounts on its own root
+ * (#ticket-detail-app), which is injected lazily into <body> by
+ * mountTicketDetailApp(). The legacy SPA opens it by calling
+ * window.openTicketDetail(id).
  */
 
 import './bootstrap';
-import { createApp } from 'vue';
+import { createApp, reactive, h } from 'vue';
 
 import TaskLists from './components/TaskLists.vue';
 import TaskListCard from './components/TaskListCard.vue';
 import TaskListSectionRow from './components/TaskListSectionRow.vue';
+import TicketDetail from './components/TicketDetail.vue';
+import TicketActions from './components/TicketActions.vue';
+import ReplyDraftModal from './components/ReplyDraftModal.vue';
 
 let _mountedVm = null;
 
@@ -49,4 +57,59 @@ window.taskListsTabHTML = () => `
 window.loadTaskLists = () => {
     const vm = mountTaskListsApp();
     if (vm && typeof vm.load === 'function') vm.load();
+};
+
+// ─── Ticket Detail viewer ───────────────────────────────────────
+//
+// Phase 2: the legacy tickets table calls window.openTicketDetail(id) when
+// the user clicks a "View detail" affordance on a row. We lazily inject a
+// mount point (#ticket-detail-app) into <body> the first time it's needed.
+
+let _ticketDetailVm = null;
+const _ticketDetailState = reactive({
+    isOpen: false,
+    ticketId: '',
+});
+
+function mountTicketDetailApp() {
+    if (_ticketDetailVm) return _ticketDetailVm;
+
+    let el = document.getElementById('ticket-detail-app');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'ticket-detail-app';
+        document.body.appendChild(el);
+    }
+
+    const state = _ticketDetailState;
+    const app = createApp({
+        name: 'TicketDetailRoot',
+        components: { TicketDetail },
+        setup() {
+            return () => h(TicketDetail, {
+                ticketId: state.ticketId,
+                isOpen: state.isOpen,
+                onClose: () => { state.isOpen = false; },
+            });
+        },
+    });
+    app.component('ticket-detail', TicketDetail);
+    app.component('ticket-actions', TicketActions);
+    app.component('reply-draft-modal', ReplyDraftModal);
+
+    _ticketDetailVm = app.mount(el);
+    return _ticketDetailVm;
+}
+
+window.openTicketDetail = (ticketId) => {
+    mountTicketDetailApp();
+    // Normalise to string and trim any leading `#`. The TicketFile loader
+    // accepts ids with or without the `T` prefix.
+    const id = String(ticketId || '').replace(/^#/, '').trim();
+    _ticketDetailState.ticketId = id;
+    _ticketDetailState.isOpen = true;
+};
+
+window.closeTicketDetail = () => {
+    _ticketDetailState.isOpen = false;
 };

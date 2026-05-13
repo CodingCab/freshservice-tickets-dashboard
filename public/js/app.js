@@ -329,7 +329,10 @@ function renderTable() {
         const updated = t.updated_at ? new Date(t.updated_at).toLocaleDateString('en-IE', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
         return `<tr>
             <td><span class="category category-${catClass}">${t.category || '-'}</span></td>
-            <td><a href="https://youritsolutions.freshservice.com/a/tickets/${t.id}" target="_blank">#${t.id}</a></td>
+            <td>
+                <a href="https://youritsolutions.freshservice.com/a/tickets/${t.id}" target="_blank">#${t.id}</a>
+                <a href="#" class="ticket-detail-link" onclick="openTicketDetailFromTable(event, '${t.id}')" title="Open inline detail viewer">Details</a>
+            </td>
             <td><span class="badge badge-${statusClass}">${STATUS_MAP[t.status] || t.status}</span></td>
             <td class="priority-${prioClass}">${PRIORITY_MAP[t.priority] || t.priority}</td>
             <td class="subject" title="${esc(t.subject)}">${esc(t.subject)}</td>
@@ -341,6 +344,22 @@ function renderTable() {
             <td>${t._internal.ticket_file ? '<a href="' + t._internal.ticket_file + '" target="_blank">View</a>' : ''}</td>
         </tr>`;
     }).join('');
+}
+
+// ─── Ticket Detail viewer (Vue) ─────────────────────────────────
+// The "Details" link in each ticket row calls into here. The Vue bundle
+// (resources/js/app.js) exposes window.openTicketDetail(id).
+
+function openTicketDetailFromTable(event, ticketId) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    if (typeof window.openTicketDetail === 'function') {
+        window.openTicketDetail(ticketId);
+    } else {
+        console.warn('openTicketDetail not available; Vue bundle not loaded?');
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────

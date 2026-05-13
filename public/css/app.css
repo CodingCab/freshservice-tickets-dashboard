@@ -124,3 +124,8 @@ a:hover { text-decoration: underline; }
 .modal-body { padding: 16px 20px; overflow-y: auto; flex: 1; }
 .mtab-content { display: none; white-space: pre-wrap; word-break: break-word; font-size: 0.85em; color: #c9d1d9; font-family: 'SF Mono', 'Fira Code', monospace; line-height: 1.5; max-height: 60vh; overflow-y: auto; }
 .mtab-content.active { display: block; }
+
+/* Inline "Details" affordance next to the FreshService ID link in the
+   tickets table. Opens the Vue TicketDetail side-panel. */
+.ticket-detail-link { margin-left: 8px; font-size: 0.78em; color: #8b949e; text-decoration: none; padding: 1px 6px; border: 1px solid #30363d; border-radius: 4px; }
+.ticket-detail-link:hover { color: #c9d1d9; border-color: #58a6ff; background: #21262d; }

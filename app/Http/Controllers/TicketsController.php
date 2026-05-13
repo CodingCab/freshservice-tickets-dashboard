@@ -2,6 +2,9 @@
 
 namespace App\Http\Controllers;
 
+use App\Services\ReplyHtmlBuilder;
+use App\Services\TicketFile;
+
 class TicketsController extends Controller
 {
     /**
@@ -129,5 +132,140 @@ class TicketsController extends Controller
             }
         }
         return response()->json(['success' => false, 'error' => 'Task not found']);
+    }
+
+    /**
+     * Return the parsed ticket file (metadata, subject, body, replies,
+     * subtasks, timeline) for the ticket detail viewer.
+     */
+    public function detail(string $ticketId)
+    {
+        $file = TicketFile::find($ticketId);
+        if ($file === null) {
+            return response()->json(['error' => 'ticket_file_not_found'], 404);
+        }
+
+        return response()->json([
+            'path'         => $file->getPath(),
+            'metadata'     => $file->getMetadata(),
+            'subject'      => $file->getSection('Subject'),
+            'body'         => $file->getSection('Body'),
+            'replies'      => $file->getReplies(),
+            'subtasks'     => $file->getSubtasks(),
+            'timeline'     => $file->getSection('Timeline'),
+            'reply_draft'  => $this->loadReplyDraft($file->getPath()),
+        ]);
+    }
+
+    /**
+     * Locate and parse the sibling reply-draft file for the given ticket.
+     *
+     * Returns null if no draft is present. Returns the parsed structure
+     * (filename, frontmatter `to` / `cc` / `language`, raw body markdown,
+     * rendered HTML preview) when one exists. The HTML preview is exactly
+     * what would be POST'd to FreshService, suitable for use as the
+     * "this is what will be sent" preview in the send-reply modal.
+     */
+    private function loadReplyDraft(string $ticketPath): ?array
+    {
+        $filename = basename($ticketPath);
+        if (!preg_match('/^(\d{8})-T([0-9]+)-fs-ticket\.md$/', $filename, $m)) {
+            return null;
+        }
+        $datePrefix = $m[1];
+        $numericId = $m[2];
+
+        $draftFilename = $datePrefix . '-T' . $numericId . '-reply-draft.md';
+        $draftPath = dirname($ticketPath) . '/' . $draftFilename;
+        if (!is_file($draftPath)) {
+            return null;
+        }
+        $markdown = @file_get_contents($draftPath);
+        if ($markdown === false || $markdown === '') {
+            return null;
+        }
+
+        $frontmatter = $this->parseFrontmatter($markdown);
+        $bodyMd = $this->extractBodyMarkdown($markdown);
+        $bodyHtmlPreview = ReplyHtmlBuilder::fromMarkdownDraft($markdown);
+
+        $to = $frontmatter['to'] ?? $this->extractSectionLine($markdown, 'To');
+        $cc = $frontmatter['cc'] ?? $this->extractSectionLine($markdown, 'CC');
+        $language = $frontmatter['language'] ?? 'en';
+        $mtime = @filemtime($draftPath);
+
+        return [
+            'filename'          => $draftFilename,
+            'path'              => $draftPath,
+            'created_at'        => $mtime ? date('c', $mtime) : null,
+            'to'                => $to,
+            'cc'                => $cc,
+            'language'          => $language,
+            'subject'           => $this->extractSectionLine($markdown, 'Subject'),
+            'body_markdown'     => $bodyMd,
+            'body_html_preview' => $bodyHtmlPreview,
+        ];
+    }
+
+    /**
+     * Minimal YAML frontmatter parser — flat key:value pairs only.
+     *
+     * @return array<string, string>
+     */
+    private function parseFrontmatter(string $markdown): array
+    {
+        $text = preg_replace("/\r\n|\r/", "\n", $markdown);
+        if (!str_starts_with($text, "---\n")) {
+            return [];
+        }
+        $end = strpos($text, "\n---", 4);
+        if ($end === false) {
+            return [];
+        }
+        $block = substr($text, 4, $end - 4);
+        $out = [];
+        foreach (explode("\n", $block) as $line) {
+            if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/', $line, $m)) {
+                $key = strtolower(trim($m[1]));
+                $value = trim($m[2]);
+                if ($value !== '') {
+                    $out[$key] = $value;
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * First non-blank line of a `## {section}` block in the draft.
+     */
+    private function extractSectionLine(string $markdown, string $section): string
+    {
+        $text = preg_replace("/\r\n|\r/", "\n", $markdown);
+        $pattern = '/^##\s+' . preg_quote($section, '/') . '\s*$(.*?)(?=^##\s+|\z)/sm';
+        if (!preg_match($pattern, $text, $m)) {
+            return '';
+        }
+        foreach (explode("\n", trim($m[1])) as $line) {
+            $line = trim($line);
+            if ($line === '' || $line === '_(none)_') {
+                continue;
+            }
+            return $line;
+        }
+        return '';
+    }
+
+    /**
+     * Return the markdown body of the draft — the contents of `## Body`, or
+     * the post-frontmatter remainder if no Body section exists.
+     */
+    private function extractBodyMarkdown(string $markdown): string
+    {
+        $text = preg_replace("/\r\n|\r/", "\n", $markdown);
+        if (preg_match('/^##\s+Body\s*$(.*?)(?=^##\s+|\z)/sm', $text, $m)) {
+            return trim($m[1]);
+        }
+        return trim($text);
     }
 }

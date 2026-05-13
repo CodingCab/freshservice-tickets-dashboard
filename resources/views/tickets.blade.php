@@ -10,6 +10,8 @@
 </head>
 <body>
     <div id="app"></div>
+    {{-- Mount point for the Vue TicketDetail side-panel. Lives outside #app so the legacy SPA shell can rewrite #app freely without unmounting it. The Vue bundle mounts on demand when window.openTicketDetail(id) is called. --}}
+    <div id="ticket-detail-app"></div>
     {{-- Hand-written SPA shell (Tickets + Agents tabs). Loads after Vite bundle so window.taskListsTabHTML / mountTaskListsApp are available during renderApp(). --}}
     {{-- defer so it runs after the @vite module bundle (which exposes window.taskListsTabHTML / mountTaskListsApp). --}}
     <script src="{{ asset('js/app.js') }}?v={{ filemtime(public_path('js/app.js')) }}" defer></script>
