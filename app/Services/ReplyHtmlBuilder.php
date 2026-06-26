@@ -26,26 +26,87 @@ namespace App\Services;
 class ReplyHtmlBuilder
 {
     /**
+     * Standard ShipTown signature footer, appended to every outgoing reply so
+     * Adam's messages carry the same branded block as the human agents (logo +
+     * ship.town + tagline). The body itself provides the "Best,/Pozdrawiam, Adam"
+     * sign-off; this is only the company block. No "quick call / Calendly" line —
+     * Adam does not offer calls (per the no-call-offers rule). FreshService strips
+     * `<p>` margins, so the block uses `<br>` separators. Logo is the canonical
+     * ship.town CDN asset (same image the human signatures use).
+     */
+    private const SIGNATURE_HTML =
+        '<br><br>ShipTown<br>'
+        . '<a href="https://ship.town">https://ship.town</a><br><br>'
+        . '<img src="https://ship.town/cdn/shop/files/ShipTownLogo-Large.png?v=1731432222&amp;width=500"'
+        . ' alt="ShipTown" width="170" style="display:block;border:0;margin:4px 0;"><br>'
+        . '<strong>Empowering Your Business with Smarter Solutions</strong>';
+
+    /**
      * Convert the full contents of a reply-draft markdown file into the HTML
      * body to POST to FreshService.
      */
     public static function fromMarkdownDraft(string $markdownBody): string
     {
-        $body = self::extractBody($markdownBody);
-        $paragraphs = self::splitParagraphs($body);
+        return self::renderBody(self::extractBody($markdownBody));
+    }
 
-        if (empty($paragraphs)) {
+    /**
+     * Convert a raw body markdown (no frontmatter, no `## Body` header) into
+     * the HTML body to POST to FreshService. Used by the manual-reply flow,
+     * where the user types body text directly in a textarea.
+     */
+    public static function fromBodyMarkdown(string $bodyMarkdown): string
+    {
+        $text = preg_replace("/\r\n|\r/", "\n", $bodyMarkdown) ?? '';
+        return self::renderBody(trim($text));
+    }
+
+    /**
+     * Same as {@see fromMarkdownDraft()} but with the standard ShipTown
+     * signature footer appended. Used at the outgoing-reply boundary (send +
+     * preview) so every reply is signed, while the pure body converters above
+     * remain signature-free. An empty body stays empty (no lone signature).
+     */
+    public static function signedFromMarkdownDraft(string $markdownBody): string
+    {
+        return self::appendSignature(self::fromMarkdownDraft($markdownBody));
+    }
+
+    /**
+     * Same as {@see fromBodyMarkdown()} but with the standard ShipTown
+     * signature footer appended. See {@see signedFromMarkdownDraft()}.
+     */
+    public static function signedFromBodyMarkdown(string $bodyMarkdown): string
+    {
+        return self::appendSignature(self::fromBodyMarkdown($bodyMarkdown));
+    }
+
+    private static function appendSignature(string $html): string
+    {
+        return $html === '' ? '' : $html . self::SIGNATURE_HTML;
+    }
+
+    private static function renderBody(string $body): string
+    {
+        $blocks = self::splitBlocks($body);
+        if (empty($blocks)) {
             return '';
         }
 
         $rendered = [];
-        $last = count($paragraphs) - 1;
-        foreach ($paragraphs as $i => $lines) {
-            // The last paragraph may be a sign-off chunk (2-3 short lines,
-            // each ≤ 30 chars) — join with `<br>` (single). All other
-            // multi-line paragraphs join with `<br>` too (soft line break).
-            $rendered[] = implode('<br>', array_map([self::class, 'escapeInline'], $lines));
-            unset($i, $last);
+        foreach ($blocks as $block) {
+            if ($block['type'] === 'code') {
+                $code = self::renderCodeBlock($block['lines']);
+                if ($code !== '') {
+                    $rendered[] = $code;
+                }
+            } else {
+                $rendered[] = implode('<br>', array_map([self::class, 'escapeInline'], $block['lines']));
+            }
+        }
+
+        if (empty($rendered)) {
+            return '';
         }
 
         return implode('<br><br>', $rendered);
@@ -118,33 +179,128 @@ class ReplyHtmlBuilder
     }
 
     /**
-     * Split body into logical paragraphs.
+     * Split the body into an ordered list of blocks — plain paragraphs and
+     * code blocks. Code is detected from either a fenced block (```...```) or
+     * an indented block (a run of lines indented 4+ spaces). Code blocks are
+     * kept verbatim so {@see renderCodeBlock()} can HTML-escape them: any code
+     * the customer must copy (e.g. an HTML/Blade label template) is then shown
+     * as literal, copyable text instead of being interpreted and rendered by
+     * the customer's mail client.
      *
-     * @return array<int, array<int, string>>  list of paragraphs, each is a
-     *   list of (already trimmed) non-blank lines.
+     * @return array<int, array{type:string, lines:array<int,string>}>
      */
-    private static function splitParagraphs(string $body): array
+    private static function splitBlocks(string $body): array
     {
         $lines = explode("\n", $body);
-        $paragraphs = [];
-        $current = [];
+        $n = count($lines);
+        $blocks = [];
+        $para = [];
 
-        foreach ($lines as $line) {
-            $trimmed = trim($line);
-            if ($trimmed === '') {
-                if (!empty($current)) {
-                    $paragraphs[] = $current;
-                    $current = [];
+        $flush = function () use (&$para, &$blocks): void {
+            if (!empty($para)) {
+                $blocks[] = ['type' => 'paragraph', 'lines' => $para];
+                $para = [];
+            }
+        };
+
+        $i = 0;
+        while ($i < $n) {
+            $line = $lines[$i];
+
+            // Fenced code block: ``` ... ```
+            if (preg_match('/^\s*```/', $line)) {
+                $flush();
+                $code = [];
+                $i++;
+                while ($i < $n && !preg_match('/^\s*```/', $lines[$i])) {
+                    $code[] = $lines[$i];
+                    $i++;
                 }
+                $i++; // consume the closing fence (or EOF)
+                $blocks[] = ['type' => 'code', 'lines' => $code];
                 continue;
             }
-            $current[] = $trimmed;
+
+            // Indented code block: a run of 4+ space indented lines, only when
+            // starting fresh (not mid-paragraph). Blank lines inside the run
+            // are kept when the block resumes afterwards.
+            if (empty($para) && preg_match('/^ {4,}\S/', $line)) {
+                $flush();
+                $code = [];
+                while ($i < $n) {
+                    if (trim($lines[$i]) === '') {
+                        $j = $i + 1;
+                        while ($j < $n && trim($lines[$j]) === '') {
+                            $j++;
+                        }
+                        if ($j < $n && preg_match('/^ {4,}\S/', $lines[$j])) {
+                            $code[] = '';
+                            $i++;
+                            continue;
+                        }
+                        break;
+                    }
+                    if (!preg_match('/^ {4,}/', $lines[$i])) {
+                        break;
+                    }
+                    $code[] = substr($lines[$i], 4); // dedent one code level
+                    $i++;
+                }
+                $blocks[] = ['type' => 'code', 'lines' => $code];
+                continue;
+            }
+
+            if (trim($line) === '') {
+                $flush();
+                $i++;
+                continue;
+            }
+
+            $para[] = trim($line);
+            $i++;
         }
-        if (!empty($current)) {
-            $paragraphs[] = $current;
+        $flush();
+
+        return $blocks;
+    }
+
+    /**
+     * Render a code block as literal, copyable text. Each line is HTML-escaped
+     * (so `<x-...>` shows as text rather than being interpreted by the mail
+     * client), leading spaces become non-breaking spaces to preserve
+     * indentation, and lines are joined with `<br>`. Wrapped in a styled
+     * `<pre>` for a monospace, visually distinct block; the `<br>`/`&nbsp;`
+     * formatting survives even if the mail client strips the `<pre>` styling.
+     *
+     * @param array<int, string> $lines
+     */
+    private static function renderCodeBlock(array $lines): string
+    {
+        // Drop leading/trailing blank lines.
+        while (!empty($lines) && trim($lines[0]) === '') {
+            array_shift($lines);
+        }
+        while (!empty($lines) && trim((string) end($lines)) === '') {
+            array_pop($lines);
+        }
+        if (empty($lines)) {
+            return '';
         }
 
-        return $paragraphs;
+        $rendered = array_map(static function (string $l): string {
+            $escaped = htmlspecialchars($l, ENT_QUOTES, 'UTF-8');
+            // Preserve leading indentation with non-breaking spaces.
+            return preg_replace_callback('/^ +/', static function (array $m): string {
+                return str_repeat('&nbsp;', strlen($m[0]));
+            }, $escaped);
+        }, $lines);
+
+        $code = implode('<br>', $rendered);
+
+        return '<pre style="font-family:Consolas,Monaco,&#39;Courier New&#39;,monospace;'
+            . 'font-size:13px;background:#f4f4f4;border:1px solid #ddd;border-radius:4px;'
+            . 'padding:10px;white-space:pre-wrap;word-break:break-word;margin:0;">'
+            . $code . '</pre>';
     }
 
     /**

@@ -2,40 +2,61 @@
     <div v-if="isOpen" class="rfm-overlay" @click.self="onCancel">
         <div class="rfm-modal" role="dialog" aria-label="Reject draft with feedback">
             <header class="rfm-header">
-                <h3 class="rfm-title">Reject draft &amp; send back</h3>
+                <h3 class="rfm-title">Reject draft &amp; send back &mdash; {{ ticketId }}</h3>
                 <button class="rfm-close" type="button" aria-label="Close" @click="onCancel">&times;</button>
             </header>
 
             <div class="rfm-body">
-                <p class="rfm-hint">
-                    The draft will go back to <strong>Reply Drafting</strong>. Your feedback is read by the
-                    drafting agent as a hard constraint when composing the new version.
-                </p>
+                <div class="rfm-split">
+                    <div class="rfm-draft-pane">
+                        <div class="rfm-draft-label">Draft (for reference)</div>
+                        <div v-if="draftLoading" class="rfm-draft-empty">Loading draft&hellip;</div>
+                        <div v-else-if="draftError" class="rfm-draft-empty rfm-draft-error">
+                            {{ draftError }}
+                        </div>
+                        <div v-else-if="!draft" class="rfm-draft-empty">No draft attached to this ticket.</div>
+                        <div v-else class="rfm-draft-scroll">
+                            <dl class="rfm-draft-meta">
+                                <template v-if="draft.to"><dt>To</dt><dd>{{ draft.to }}</dd></template>
+                                <template v-if="draft.cc && !ccIsEmpty"><dt>CC</dt><dd>{{ draft.cc }}</dd></template>
+                                <template v-if="draft.subject"><dt>Subj</dt><dd>{{ draft.subject }}</dd></template>
+                                <template v-if="draft.language"><dt>Lang</dt><dd>{{ draft.language }}</dd></template>
+                            </dl>
+                            <div class="rfm-draft-html" v-html="draft.body_html_preview"></div>
+                        </div>
+                    </div>
 
-                <label class="rfm-label" :for="textareaId">Feedback</label>
-                <textarea
-                    :id="textareaId"
-                    ref="textareaRef"
-                    v-model="feedback"
-                    class="rfm-textarea"
-                    rows="6"
-                    :maxlength="MAX_LEN"
-                    :disabled="submitting"
-                    placeholder='What needs to change? E.g. "make the tone less formal", "address concern #3 separately"'
-                ></textarea>
+                    <div class="rfm-feedback-pane">
+                        <p class="rfm-hint">
+                            The draft will go back to <strong>Reply Drafting</strong>. Your feedback is read by the
+                            drafting agent as a hard constraint when composing the new version.
+                        </p>
 
-                <div class="rfm-counter-row">
-                    <span class="rfm-counter" :class="{ 'rfm-counter-warn': feedback.length > (MAX_LEN - 50) }">
-                        {{ feedback.length }} / {{ MAX_LEN }}
-                    </span>
-                    <span v-if="feedback.length > 0 && feedback.length < MIN_LEN" class="rfm-counter-warn">
-                        min {{ MIN_LEN }} chars
-                    </span>
+                        <label class="rfm-label" :for="textareaId">Feedback</label>
+                        <textarea
+                            :id="textareaId"
+                            ref="textareaRef"
+                            v-model="feedback"
+                            class="rfm-textarea"
+                            rows="10"
+                            :maxlength="MAX_LEN"
+                            :disabled="submitting"
+                            placeholder='What needs to change? E.g. "make the tone less formal", "address concern #3 separately"'
+                        ></textarea>
+
+                        <div class="rfm-counter-row">
+                            <span class="rfm-counter" :class="{ 'rfm-counter-warn': feedback.length > (MAX_LEN - 50) }">
+                                {{ feedback.length }} / {{ MAX_LEN }}
+                            </span>
+                            <span v-if="feedback.length > 0 && feedback.length < MIN_LEN" class="rfm-counter-warn">
+                                min {{ MIN_LEN }} chars
+                            </span>
+                        </div>
+
+                        <div v-if="errorMessage" class="rfm-error">{{ errorMessage }}</div>
+                        <div v-if="successMessage" class="rfm-success">{{ successMessage }}</div>
+                    </div>
                 </div>
-
-                <div v-if="errorMessage" class="rfm-error">{{ errorMessage }}</div>
-
-                <div v-if="successMessage" class="rfm-success">{{ successMessage }}</div>
             </div>
 
             <footer class="rfm-footer">
@@ -86,14 +107,22 @@ export default {
             errorMessage: '',
             successMessage: '',
             MIN_LEN: 5,
-            MAX_LEN: 500,
+            MAX_LEN: 2000,
             textareaId: 'rfm-textarea-' + Math.random().toString(36).slice(2, 8),
+            draft: null,
+            draftLoading: false,
+            draftError: '',
         };
     },
     computed: {
         canSubmit() {
             const len = this.feedback.trim().length;
             return len >= this.MIN_LEN && len <= this.MAX_LEN;
+        },
+        ccIsEmpty() {
+            const cc = (this.draft && this.draft.cc) || '';
+            const norm = cc.trim().toLowerCase();
+            return norm === '' || norm === '—' || norm === '_(none)_' || norm === '(none)';
         },
     },
     watch: {
@@ -103,6 +132,9 @@ export default {
                 this.errorMessage = '';
                 this.successMessage = '';
                 this.submitting = false;
+                this.draft = null;
+                this.draftError = '';
+                this.loadDraft();
                 this.$nextTick(() => {
                     if (this.$refs.textareaRef) this.$refs.textareaRef.focus();
                 });
@@ -110,6 +142,22 @@ export default {
         },
     },
     methods: {
+        async loadDraft() {
+            if (!this.ticketId) return;
+            this.draftLoading = true;
+            this.draftError = '';
+            try {
+                const resp = await fetch('/api/tickets/' + encodeURIComponent(this.ticketId) + '/detail');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                this.draft = data && data.reply_draft ? data.reply_draft : null;
+                if (!this.draft) this.draftError = 'No draft attached to this ticket.';
+            } catch (e) {
+                this.draftError = 'Failed to load draft: ' + (e.message || String(e));
+            } finally {
+                this.draftLoading = false;
+            }
+        },
         onCancel() {
             if (this.submitting) return;
             this.$emit('close');
@@ -186,7 +234,8 @@ export default {
     padding: 20px;
 }
 .rfm-modal {
-    width: min(520px, 100%);
+    width: min(960px, 100%);
+    max-height: 90vh;
     background: #0d1117;
     color: #c9d1d9;
     border: 1px solid #30363d;
@@ -195,6 +244,82 @@ export default {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+}
+.rfm-body { overflow: hidden; flex: 1; padding: 0; min-height: 0; }
+.rfm-split {
+    display: flex;
+    gap: 0;
+    height: 100%;
+    min-height: 0;
+}
+.rfm-draft-pane,
+.rfm-feedback-pane {
+    flex: 1 1 50%;
+    padding: 14px 16px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    /* Allow flex children to shrink below their natural content size so the
+       inner `.rfm-draft-scroll` can size to the available space and scroll.
+       Without `min-height: 0` flex defaults to `min-height: auto` (= content
+       height) which makes the pane stretch to fit the preview and breaks the
+       inner scroll. Classic flexbox gotcha — was making the draft preview
+       overflow the modal and become unscrollable. */
+    min-height: 0;
+    min-width: 0;
+}
+.rfm-draft-pane {
+    border-right: 1px solid #30363d;
+    background: #0a0e14;
+}
+.rfm-draft-label {
+    font-size: 11.5px;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 8px;
+}
+.rfm-draft-empty {
+    color: #8b949e;
+    font-size: 12.5px;
+    padding: 12px 0;
+}
+.rfm-draft-error { color: #f85149; }
+.rfm-draft-scroll {
+    flex: 1;
+    overflow-y: auto;
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 10px 12px;
+    /* Same flexbox gotcha as the pane — the scroll container needs an explicit
+       `min-height: 0` to be allowed to shrink below its content size, otherwise
+       it stretches to the preview's full height and there is nothing to scroll. */
+    min-height: 0;
+}
+.rfm-draft-meta {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 10px;
+    font-size: 11.5px;
+    margin: 0 0 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px dashed #21262d;
+}
+.rfm-draft-meta dt { color: #c9d1d9; font-weight: 700; }
+.rfm-draft-meta dd { margin: 0; color: #8b949e; word-break: break-word; }
+.rfm-draft-html {
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: #c9d1d9;
+    word-break: break-word;
+}
+.rfm-draft-html :deep(p) { margin: 0 0 8px; }
+.rfm-draft-html :deep(p:last-child) { margin-bottom: 0; }
+.rfm-draft-html :deep(a) { color: #58a6ff; }
+@media (max-width: 720px) {
+    .rfm-split { flex-direction: column; min-height: 0; }
+    .rfm-draft-pane { border-right: 0; border-bottom: 1px solid #30363d; }
 }
 .rfm-header {
     display: flex;

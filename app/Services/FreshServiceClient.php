@@ -77,25 +77,51 @@ class FreshServiceClient
     }
 
     /**
-     * Invoke `python3 freshservice_api.py post <endpoint> <json>` and parse stdout JSON.
+     * PUT `/api/v2/tickets/{id}` to set the ticket's status.
      *
-     * @param array<string, mixed> $payload
-     * @return array<string, mixed>
+     * FreshService status codes: 2=Open, 3=Pending, 4=Resolved, 5=Closed.
+     *
+     * @return array<string, mixed>  The parsed `ticket` object.
      */
-    private function callPost(string $endpoint, array $payload): array
+    public function setStatus(int $ticketId, int $statusCode): array
     {
-        $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($json === false) {
-            throw new RuntimeException('Unable to JSON-encode FreshService payload');
+        $endpoint = '/api/v2/tickets/' . $ticketId;
+        $response = $this->callPut($endpoint, ['status' => $statusCode]);
+
+        if (!isset($response['ticket']) || !is_array($response['ticket'])) {
+            throw new RuntimeException(
+                'Unexpected FreshService response from ticket update endpoint: '
+                . json_encode($response)
+            );
         }
 
+        return $response['ticket'];
+    }
+
+    /**
+     * Backwards-compatible shorthand for `setStatus($id, 5)` (Closed).
+     *
+     * @return array<string, mixed>  The parsed `ticket` object.
+     */
+    public function closeTicket(int $ticketId): array
+    {
+        return $this->setStatus($ticketId, 5);
+    }
+
+    /**
+     * GET `<endpoint>` — used by the dashboard to fetch ticket/conversation
+     * HTML payloads for inline-image rendering.
+     *
+     * @return array<string, mixed>
+     */
+    public function get(string $endpoint): array
+    {
         $process = new Process([
             'python3',
             self::HELPER_PATH,
-            'post',
+            'get',
             $endpoint,
-            $json,
-        ]);
+        ], null, $this->helperEnv());
         $process->setTimeout(self::TIMEOUT_SECONDS);
 
         try {
@@ -127,5 +153,139 @@ class FreshServiceClient
         }
 
         return $decoded;
+    }
+
+    /**
+     * Invoke `python3 freshservice_api.py post <endpoint> <json>` and parse stdout JSON.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    private function callPost(string $endpoint, array $payload): array
+    {
+        $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            throw new RuntimeException('Unable to JSON-encode FreshService payload');
+        }
+
+        $process = new Process([
+            'python3',
+            self::HELPER_PATH,
+            'post',
+            $endpoint,
+            $json,
+        ], null, $this->helperEnv());
+        $process->setTimeout(self::TIMEOUT_SECONDS);
+
+        try {
+            $process->run();
+        } catch (\Throwable $e) {
+            throw new RuntimeException(
+                'FreshService helper failed to launch: ' . $e->getMessage(),
+                0,
+                $e
+            );
+        }
+
+        $stdout = $process->getOutput();
+        $stderr = $process->getErrorOutput();
+
+        if (!$process->isSuccessful()) {
+            throw new RuntimeException(
+                'FreshService helper exited with code ' . $process->getExitCode()
+                . ': ' . trim($stderr ?: $stdout)
+            );
+        }
+
+        $decoded = json_decode($stdout, true);
+        if (!is_array($decoded)) {
+            throw new RuntimeException(
+                'FreshService helper returned unparseable response. '
+                . 'stdout: ' . trim($stdout) . ' | stderr: ' . trim($stderr)
+            );
+        }
+
+        return $decoded;
+    }
+
+    /**
+     * Invoke `python3 freshservice_api.py put <endpoint> <json>` and parse stdout JSON.
+     *
+     * Mirrors callPost() — only the helper subcommand differs.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    private function callPut(string $endpoint, array $payload): array
+    {
+        $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            throw new RuntimeException('Unable to JSON-encode FreshService payload');
+        }
+
+        $process = new Process([
+            'python3',
+            self::HELPER_PATH,
+            'put',
+            $endpoint,
+            $json,
+        ], null, $this->helperEnv());
+        $process->setTimeout(self::TIMEOUT_SECONDS);
+
+        try {
+            $process->run();
+        } catch (\Throwable $e) {
+            throw new RuntimeException(
+                'FreshService helper failed to launch: ' . $e->getMessage(),
+                0,
+                $e
+            );
+        }
+
+        $stdout = $process->getOutput();
+        $stderr = $process->getErrorOutput();
+
+        if (!$process->isSuccessful()) {
+            throw new RuntimeException(
+                'FreshService helper exited with code ' . $process->getExitCode()
+                . ': ' . trim($stderr ?: $stdout)
+            );
+        }
+
+        $decoded = json_decode($stdout, true);
+        if (!is_array($decoded)) {
+            throw new RuntimeException(
+                'FreshService helper returned unparseable response. '
+                . 'stdout: ' . trim($stdout) . ' | stderr: ' . trim($stderr)
+            );
+        }
+
+        return $decoded;
+    }
+
+    /**
+     * Build the env array passed to the Python helper. The helper reads
+     * FRESHSERVICE_DOMAIN / FRESHSERVICE_API_KEY before falling back to its
+     * own (interactive, getpass-based) password manager. Under php-fpm there
+     * is no TTY, so the fallback path EOFs — we MUST supply both vars.
+     *
+     * @return array<string, string>
+     */
+    private function helperEnv(): array
+    {
+        $domain = (string) env('FRESHSERVICE_DOMAIN', '');
+        $apiKey = (string) env('FRESHSERVICE_API_KEY', '');
+
+        if ($domain === '' || $apiKey === '') {
+            throw new RuntimeException(
+                'FreshService credentials missing: set FRESHSERVICE_DOMAIN and '
+                . 'FRESHSERVICE_API_KEY in the dashboard .env file.'
+            );
+        }
+
+        return [
+            'FRESHSERVICE_DOMAIN'  => $domain,
+            'FRESHSERVICE_API_KEY' => $apiKey,
+        ];
     }
 }

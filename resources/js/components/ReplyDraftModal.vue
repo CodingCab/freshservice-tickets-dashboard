@@ -15,10 +15,16 @@
                     No draft found for this ticket.
                 </div>
                 <template v-else>
-                    <p class="rdm-recipient">
+                    <div v-if="alreadySent" class="rdm-sent-banner">
+                        ✅ Already sent on {{ draft.sent_at }}<template v-if="draft.conversation_id"> &mdash; FS conversation #{{ draft.conversation_id }}</template>.
+                    </div>
+                    <p v-else class="rdm-recipient">
                         This is the email that will be sent to <strong>{{ draft.to }}</strong>.
                     </p>
                     <dl class="rdm-meta">
+                        <template v-if="draft.sent_at">
+                            <dt>Sent</dt><dd>{{ draft.sent_at }}</dd>
+                        </template>
                         <template v-if="draft.created_at">
                             <dt>Created</dt><dd>{{ formattedCreatedAt }}</dd>
                         </template>
@@ -32,8 +38,15 @@
                             <dt>Lang</dt><dd>{{ draft.language }}</dd>
                         </template>
                     </dl>
-                    <div class="rdm-preview-label">Body preview (HTML as customer will see it):</div>
-                    <div class="rdm-preview" v-html="draft.body_html_preview"></div>
+                    <div class="rdm-preview-label">Body — edit if needed, then send (this exact text goes to the customer):</div>
+                    <textarea
+                        class="rdm-editbody"
+                        v-model="editBody"
+                        :disabled="sending || !!sendSuccess || alreadySent"
+                        rows="14"
+                        spellcheck="true"
+                    ></textarea>
+                    <p class="rdm-sig-note">The standard ShipTown signature (logo · ship.town · tagline) is appended automatically when sent — no need to add it here.</p>
                 </template>
 
                 <div v-if="sendError" class="rdm-send-error">{{ sendError }}</div>
@@ -48,19 +61,29 @@
                     class="btn btn-secondary"
                     :disabled="sending"
                     @click="cancel"
-                >Cancel</button>
-                <button
-                    type="button"
-                    class="btn btn-reject"
-                    :disabled="sending || !!sendSuccess"
-                    @click="requestReject"
-                >Reject + feedback</button>
-                <button
-                    type="button"
-                    class="btn btn-primary"
-                    :disabled="!canSend"
-                    @click="send"
-                >{{ sending ? 'Sending&hellip;' : 'Send now' }}</button>
+                >{{ alreadySent ? 'Close' : 'Cancel' }}</button>
+                <template v-if="!alreadySent">
+                    <button
+                        type="button"
+                        class="btn btn-reject"
+                        :disabled="sending || !!sendSuccess"
+                        @click="requestReject"
+                    >Reject + feedback</button>
+                    <button
+                        v-if="canOverrideMismatch"
+                        type="button"
+                        class="btn btn-warning"
+                        :disabled="sending || !!sendSuccess"
+                        @click="sendAnyway"
+                    >{{ sending ? 'Sending&hellip;' : 'Send anyway' }}</button>
+                    <button
+                        v-else
+                        type="button"
+                        class="btn btn-primary"
+                        :disabled="!canSend"
+                        @click="send"
+                    >{{ sending ? 'Sending&hellip;' : 'Send now' }}</button>
+                </template>
             </footer>
         </div>
     </div>
@@ -98,14 +121,20 @@ export default {
             loading: false,
             loadError: '',
             draft: null,
+            editBody: '',
             sending: false,
             sendError: '',
             sendSuccess: null,
+            canOverrideMismatch: false,
         };
     },
     computed: {
+        alreadySent() {
+            return !!(this.draft && this.draft.sent_at);
+        },
         canSend() {
-            return !!this.draft && !this.sending && !this.sendSuccess;
+            return !!this.draft && !this.sending && !this.sendSuccess && !this.alreadySent
+                && this.editBody.trim() !== '';
         },
         ccIsEmpty() {
             const cc = (this.draft && this.draft.cc) || '';
@@ -140,9 +169,11 @@ export default {
         reset() {
             this.loadError = '';
             this.draft = null;
+            this.editBody = '';
             this.sendError = '';
             this.sendSuccess = null;
             this.sending = false;
+            this.canOverrideMismatch = false;
         },
         async loadDraft() {
             this.loading = true;
@@ -153,6 +184,7 @@ export default {
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 const data = await resp.json();
                 this.draft = data && data.reply_draft ? data.reply_draft : null;
+                this.editBody = this.draft && this.draft.body_markdown ? this.draft.body_markdown : '';
                 if (!this.draft) {
                     this.loadError = 'no draft for this ticket';
                 }
@@ -171,23 +203,49 @@ export default {
             this.$emit('reject-requested');
             this.cancel();
         },
-        async send() {
+        friendlySendError(body, status) {
+            const code = body && body.error;
+            const current = body && body.current;
+            if (code === 'wrong_section') {
+                return current
+                    ? `Can't send yet — this ticket is in "${current}", not "Ready to Send". It still has to pass Security Check and reach Ready to Send before it can be sent.`
+                    : `Can't send — the ticket isn't in "Ready to Send" yet (it must pass Security Check first).`;
+            }
+            if (code === 'ticket_file_not_found') return "Can't send — the ticket file wasn't found.";
+            if (code === 'bad_filename') return "Can't send — the ticket filename is malformed.";
+            if (code === 'draft_not_found' || code === 'no_draft' || code === 'reply_draft_not_found') return "Can't send — no reply draft was found for this ticket.";
+            if (code === 'already_sent') return 'This reply has already been sent.';
+            if (code === 'requester_mismatch') {
+                return (body && body.message)
+                    ? body.message
+                    : `The draft is addressed to ${(body && body.to) || '(none)'} but the ticket requester is ${(body && body.requester) || '(none)'}. Confirm to send anyway.`;
+            }
+            if (code) return code + (body && body.message ? ': ' + body.message : '');
+            return 'Send failed (HTTP ' + status + ').';
+        },
+        async send({ overrideMismatch = false } = {}) {
             this.sending = true;
             this.sendError = '';
             try {
+                // Send the edited text only if the user actually changed it;
+                // otherwise send {} so the backend uses the original draft file
+                // verbatim (no rendering drift for the untouched case).
+                const original = (this.draft && this.draft.body_markdown ? this.draft.body_markdown : '').trim();
+                const payload = this.editBody.trim() !== original ? { body: this.editBody } : {};
+                if (overrideMismatch) payload.confirm_requester_mismatch = true;
                 const resp = await fetch(
                     '/api/tickets/' + encodeURIComponent(this.ticketId) + '/send-reply',
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                        body: JSON.stringify({}),
+                        body: JSON.stringify(payload),
                     }
                 );
                 const body = await resp.json().catch(() => ({}));
                 if (!resp.ok) {
-                    this.sendError = body && body.error
-                        ? body.error + (body.message ? ': ' + body.message : '')
-                        : 'HTTP ' + resp.status;
+                    this.sendError = this.friendlySendError(body, resp.status);
+                    // Offer an explicit override path for a recipient mismatch.
+                    this.canOverrideMismatch = body && body.error === 'requester_mismatch' && body.can_override === true;
                     return;
                 }
                 this.sendSuccess = body;
@@ -197,6 +255,10 @@ export default {
             } finally {
                 this.sending = false;
             }
+        },
+        sendAnyway() {
+            this.canOverrideMismatch = false;
+            this.send({ overrideMismatch: true });
         },
     },
 };
@@ -294,6 +356,23 @@ export default {
     color: #c9d1d9;
     word-break: break-word;
 }
+.rdm-editbody {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 220px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 12px 14px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.55;
+    color: #c9d1d9;
+    resize: vertical;
+}
+.rdm-editbody:focus { outline: none; border-color: #1f6feb; }
+.rdm-editbody:disabled { opacity: 0.6; }
+.rdm-sig-note { margin: 6px 0 0; font-size: 11.5px; color: #6e7681; font-style: italic; }
 
 .rdm-send-error {
     margin-top: 12px;
@@ -312,6 +391,16 @@ export default {
     color: #79c0ff;
     border-radius: 6px;
     font-size: 13px;
+}
+.rdm-sent-banner {
+    margin: 0 0 12px;
+    padding: 10px 14px;
+    border: 1px solid #2ea04355;
+    background: #0d1f17;
+    color: #56d364;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
 }
 
 .rdm-footer {
@@ -337,6 +426,12 @@ export default {
     border-color: #1f6feb;
 }
 .btn-primary:hover:not(:disabled) { background: #388bfd; }
+.btn-warning {
+    background: #9e6a00;
+    color: #fff;
+    border-color: #9e6a00;
+}
+.btn-warning:hover:not(:disabled) { background: #bd8200; }
 .btn-secondary {
     background: #21262d;
     color: #c9d1d9;

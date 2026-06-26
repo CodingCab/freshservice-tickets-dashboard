@@ -7,20 +7,18 @@
             @click="emitAction('send-reply')"
         >Send draft</button>
         <button
+            v-if="!isClosed"
             type="button"
             class="btn btn-secondary"
-            @click="emitAction('reject-draft')"
-        >Reject + feedback</button>
+            @click="emitAction('compose-reply')"
+        >Compose reply</button>
         <button
+            v-if="!isClosed"
             type="button"
             class="btn btn-secondary"
-            @click="emitAction('add-subtask')"
-        >Add follow-on subtask</button>
-        <button
-            type="button"
-            class="btn btn-secondary"
-            @click="emitAction('complete-consult')"
-        >Complete consult</button>
+            title="Tell the agent what to do (draft a reply, create a subtask, look up data, etc.). The agent reads the full ticket context, follows your instruction, and the result lands in the ticket's pipeline."
+            @click="emitAction('ai-compose')"
+        >🤖 Ask agent</button>
         <button
             type="button"
             class="btn btn-secondary"
@@ -28,9 +26,43 @@
         >Override to Human Review</button>
         <button
             type="button"
-            class="btn btn-danger"
-            @click="emitAction('close')"
-        >Close ticket</button>
+            class="btn btn-secondary btn-feedback"
+            title="Report what the automation should have done differently. Instructions are updated so similar cases work better next time, not just this one."
+            @click="emitAction('report-automation')"
+        >⚑ Report automation issue</button>
+        <button
+            type="button"
+            class="btn btn-secondary btn-feedback"
+            title="Add a fact agents should know going forward. Triage decides where it fits; applies to all future relevant cases."
+            @click="emitAction('add-knowledge-fact')"
+        >📚 Add knowledge fact</button>
+        <div v-if="!isClosed" class="status-dropdown">
+            <button
+                type="button"
+                class="btn btn-danger dropdown-toggle"
+                @click="toggleStatusMenu"
+                aria-haspopup="true"
+                :aria-expanded="statusMenuOpen ? 'true' : 'false'"
+            >Set status ▾</button>
+            <ul v-if="statusMenuOpen" class="status-menu" role="menu">
+                <li role="none">
+                    <button type="button" role="menuitem" class="status-menu-item"
+                            @click="pickStatus('open')">Open</button>
+                </li>
+                <li role="none">
+                    <button type="button" role="menuitem" class="status-menu-item"
+                            @click="pickStatus('pending')">Pending</button>
+                </li>
+                <li role="none">
+                    <button type="button" role="menuitem" class="status-menu-item"
+                            @click="pickStatus('resolved')">Resolved</button>
+                </li>
+                <li role="none">
+                    <button type="button" role="menuitem" class="status-menu-item status-menu-item--danger"
+                            @click="pickStatus('closed')">Closed</button>
+                </li>
+            </ul>
+        </div>
     </div>
 </template>
 
@@ -53,17 +85,65 @@ export default {
         data: { type: Object, default: null },
     },
     emits: ['action'],
+    data() {
+        return { statusMenuOpen: false };
+    },
+    mounted() {
+        document.addEventListener('click', this.handleDocumentClick);
+    },
+    beforeUnmount() {
+        document.removeEventListener('click', this.handleDocumentClick);
+    },
     computed: {
         canSendDraft() {
-            // Phase 2: always enabled. Phase 3 will gate on:
-            //   - data.replies contains an entry with role=agent, type=draft proposal
-            //   - data.metadata['Security Check'] indicates pass
+            // Enabled only when (a) there's a non-stale current draft and
+            // (b) the most recent Security Check verdict on the parent ticket
+            // is `pass`. Failed-and-stale drafts are explicitly not sendable —
+            // they're either auto-retrying in Reply Drafting (rewritable
+            // findings) or parked in Human Review for admin action
+            // (infrastructural findings). If the draft has already been sent,
+            // the Send button isn't relevant — return false to keep it
+            // disabled (the "Reply sent" badge handles that state).
+            if (!this.data || !this.data.metadata) return false;
+
+            // Already sent → no Send action needed
+            if (this.data.reply_draft && this.data.reply_draft.sent_at) return false;
+
+            // No draft to send
+            if (!this.data.reply_draft) return false;
+
+            // Reply Draft metadata marked stale (rejected / superseded by security retry)
+            const draftMeta = String(this.data.metadata['Reply Draft'] || '');
+            if (draftMeta.toLowerCase().includes('stale')) return false;
+
+            // Security Check must have run and verdict must be pass
+            const sec = String(this.data.metadata['Security Check'] || '').trim().toLowerCase();
+            if (!sec || !sec.startsWith('pass')) return false;
+
             return true;
+        },
+        isClosed() {
+            const status = (this.data && this.data.metadata && this.data.metadata.Status) || '';
+            return String(status).trim().toLowerCase() === 'closed';
         },
     },
     methods: {
         emitAction(key) {
             this.$emit('action', key);
+        },
+        toggleStatusMenu(event) {
+            event.stopPropagation();
+            this.statusMenuOpen = !this.statusMenuOpen;
+        },
+        pickStatus(name) {
+            this.statusMenuOpen = false;
+            this.$emit('action', 'set-status:' + name);
+        },
+        handleDocumentClick(event) {
+            if (!this.statusMenuOpen) return;
+            if (!this.$el || !this.$el.contains(event.target)) {
+                this.statusMenuOpen = false;
+            }
         },
     },
 };
@@ -106,6 +186,15 @@ export default {
 .btn-secondary:hover:not(:disabled) {
     background: #30363d;
 }
+.btn-feedback {
+    margin-left: auto;
+    color: #d29922;
+    border-color: #d2992255;
+}
+.btn-feedback:hover:not(:disabled) {
+    background: #3a2d12;
+    border-color: #d29922;
+}
 .btn-danger {
     background: #21262d;
     color: #f85149;
@@ -114,5 +203,42 @@ export default {
 .btn-danger:hover:not(:disabled) {
     background: #4a1d1d;
     border-color: #f85149;
+}
+.status-dropdown {
+    position: relative;
+}
+.status-menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    min-width: 160px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    list-style: none;
+    margin: 0;
+    padding: 4px;
+    z-index: 50;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.status-menu-item {
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: #c9d1d9;
+    border: 0;
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    cursor: pointer;
+}
+.status-menu-item:hover {
+    background: #21262d;
+}
+.status-menu-item--danger {
+    color: #f85149;
+}
+.status-menu-item--danger:hover {
+    background: #4a1d1d;
 }
 </style>

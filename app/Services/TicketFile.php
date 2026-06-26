@@ -135,7 +135,11 @@ class TicketFile
     public function getReplies(): array
     {
         $section = $this->getSection('Replies');
-        if ($section === '' || str_contains($section, '_(none')) {
+        // Treat the section as empty only when its WHOLE body is the
+        // `_(none)_` placeholder. A substring check is wrong here —
+        // individual replies routinely contain `**Attachments:** _(none)_`,
+        // which used to short-circuit the entire parse to [].
+        if ($section === '' || trim($section) === '_(none)_') {
             return [];
         }
 
@@ -292,6 +296,30 @@ class TicketFile
     {
         $this->mutate(function (string $contents) use ($key, $value): string {
             return self::upsertMetadataLine($contents, $key, $value);
+        });
+    }
+
+    /**
+     * Set (replace) or insert a whole `## {name}` section's body. If the
+     * section exists, its body is replaced with $body. Otherwise the section
+     * is inserted immediately before `## Timeline` (or appended at the end if
+     * there is no Timeline section). Used for the single editable operator note.
+     */
+    public function setSection(string $name, string $body): void
+    {
+        $this->mutate(function (string $contents) use ($name, $body): string {
+            $block = "## " . $name . "\n\n" . trim($body) . "\n";
+            $pattern = '/^##\s+' . preg_quote($name, '/') . '\s*$.*?(?=^##\s+|\z)/sm';
+            if (preg_match($pattern, $contents)) {
+                // Replace existing section (keep one trailing blank line).
+                return preg_replace($pattern, $block . "\n", $contents, 1);
+            }
+            // Insert before ## Timeline, else append at end.
+            if (preg_match('/^##\s+Timeline\s*$/m', $contents, $m, PREG_OFFSET_CAPTURE)) {
+                $at = (int) $m[0][1];
+                return rtrim(substr($contents, 0, $at), "\n") . "\n\n" . $block . "\n" . substr($contents, $at);
+            }
+            return rtrim($contents, "\n") . "\n\n" . $block;
         });
     }
 
