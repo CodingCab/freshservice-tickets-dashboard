@@ -24,6 +24,25 @@ h1 { font-size: 1.1em; margin-bottom: 8px; color: #fff; }
 .filter-btn:hover { background: #30363d; }
 .filter-btn.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 
+/* ─── Starred-ticket filter button + per-row star ───────────────── */
+.filter-btn-starred { color: #e1a700; }
+.filter-btn-starred.active { background: #6b4d00; border-color: #d29922; color: #ffd76b; }
+.star-col { width: 32px; text-align: center; padding-left: 2px; padding-right: 2px; }
+.ticket-star {
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    color: #6e7681;
+    user-select: none;
+    display: inline-block;
+    padding: 2px 4px;
+    border-radius: 4px;
+    transition: color 80ms ease, background 80ms ease;
+}
+.ticket-star:hover { color: #d29922; background: rgba(210, 153, 34, 0.10); }
+.ticket-star.starred { color: #ffd76b; text-shadow: 0 0 4px rgba(255, 215, 107, 0.45); }
+.row-starred { background: rgba(255, 215, 107, 0.04); }
+
 /* Table */
 table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
 th { background: #21262d; text-align: left; padding: 4px 8px; font-size: 0.65em; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; user-select: none; white-space: nowrap; }
@@ -43,6 +62,23 @@ a:hover { text-decoration: underline; }
 .badge-notification { background: #1a3a4d; color: #58a6ff; }
 .badge-closed { background: #3d1a1a; color: #f85149; }
 .badge-resolved { background: #2a1a4d; color: #bc8cff; }
+
+/* Pipeline-stage badges (internal section from TICKETS-TASK-LIST.md). */
+.badge-stage { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; font-weight: 500; }
+.badge-stage-none { background: transparent; color: #6e7681; font-style: italic; }
+.badge-stage-new { background: #1a3a4d; color: #79c0ff; }
+.badge-stage-decomposition { background: #2a1a4d; color: #bc8cff; }
+.badge-stage-awaiting-subtasks { background: #1a2a4d; color: #79c0ff; }
+.badge-stage-reply-drafting { background: #2a2a1a; color: #d29922; }
+.badge-stage-security-check { background: #4d3a1a; color: #f0b656; }
+.badge-stage-ready-to-send { background: #1a4d2e; color: #56d364; }
+.badge-stage-replied-awaiting-customer { background: #1a4d3a; color: #56d364; }
+.badge-stage-customer-replied { background: #2a4d1a; color: #a5d75c; }
+.badge-stage-human-review { background: #4d2a1a; color: #ff7b72; }
+.badge-stage-informational { background: #1a3a4d; color: #58a6ff; }
+.badge-stage-notification { background: #1a3a4d; color: #58a6ff; }
+.badge-stage-spam { background: #2d1318; color: #ff7b72; }
+.badge-stage-closed { background: #3d1a1a; color: #f85149; }
 
 /* Categories */
 .category { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; background: #21262d; color: #8b949e; }
@@ -124,3 +160,98 @@ a:hover { text-decoration: underline; }
 .modal-body { padding: 16px 20px; overflow-y: auto; flex: 1; }
 .mtab-content { display: none; white-space: pre-wrap; word-break: break-word; font-size: 0.85em; color: #c9d1d9; font-family: 'SF Mono', 'Fira Code', monospace; line-height: 1.5; max-height: 60vh; overflow-y: auto; }
 .mtab-content.active { display: block; }
+
+/* Inline "Details" affordance next to the FreshService ID link in the
+   tickets table. Opens the Vue TicketDetail side-panel. */
+.ticket-detail-link { margin-left: 8px; font-size: 0.78em; color: #8b949e; text-decoration: none; padding: 1px 6px; border: 1px solid #30363d; border-radius: 4px; }
+.ticket-detail-link:hover { color: #c9d1d9; border-color: #58a6ff; background: #21262d; }
+
+/* ─── FreshService connection health badge + modal ───────────────── */
+.fs-health-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    padding: 3px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.78em;
+    font-family: inherit;
+}
+.fs-health-badge:hover { border-color: #58a6ff; }
+.fs-health-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #8b949e;
+}
+.fs-health-ok .fs-health-dot { background: #2ea043; box-shadow: 0 0 6px #2ea04388; }
+.fs-health-ok .fs-health-label { color: #56d364; }
+.fs-health-fail .fs-health-dot { background: #f85149; box-shadow: 0 0 6px #f8514988; animation: fs-health-pulse 1.4s infinite; }
+.fs-health-fail .fs-health-label { color: #ff7b72; }
+.fs-health-unknown .fs-health-dot { background: #8b949e; }
+@keyframes fs-health-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.4; }
+}
+
+.fs-health-modal-content { max-width: 720px; }
+.fs-health-modal-content .modal-body { padding: 18px 20px; overflow-y: auto; }
+.fs-health-banner {
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin-bottom: 14px;
+    font-weight: 500;
+}
+.fs-health-banner-ok   { background: #1d3a25; color: #56d364; border: 1px solid #2ea04344; }
+.fs-health-banner-fail { background: #3d1c1c; color: #ff7b72; border: 1px solid #f8514944; }
+.fs-health-tested-at { color: #8b949e; font-size: 0.85em; margin: 4px 0; }
+.fs-health-tested-at code { background: #0d1117; padding: 1px 6px; border-radius: 3px; color: #c9d1d9; }
+.fs-health-age { color: #8b949e; font-size: 0.8em; margin: 4px 0 14px; font-style: italic; }
+.fs-check-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.fs-check-row {
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 10px 14px;
+}
+.fs-check-row.fs-check-fail { border-color: #f8514944; }
+.fs-check-name { font-weight: 500; color: #e1e4e8; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.fs-check-mark { font-size: 1.1em; }
+.fs-check-ok   .fs-check-mark { color: #2ea043; }
+.fs-check-fail .fs-check-mark { color: #f85149; }
+.fs-check-detail { color: #8b949e; font-size: 0.85em; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+.fs-check-detail code { color: #c9d1d9; }
+.fs-check-error { color: #ff7b72; word-break: break-word; }
+.fs-health-source { color: #6e7681; font-size: 0.75em; margin-top: 16px; padding-top: 12px; border-top: 1px solid #21262d; }
+.fs-health-source code { background: #0d1117; padding: 1px 5px; border-radius: 3px; color: #8b949e; }
+
+/* ─── Automation Feedback tab ─── */
+.feedback-intro { color: #8b949e; font-size: 0.85em; margin: 0 0 14px; }
+#feedbackContainer { display: flex; flex-direction: column; gap: 12px; max-width: 900px; }
+.feedback-empty { color: #8b949e; font-size: 0.9em; }
+.fb-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 14px; }
+.fb-card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.fb-ticket { font-weight: 600; }
+.fb-ticket a { color: #58a6ff; text-decoration: none; }
+.fb-ticket a:hover { text-decoration: underline; }
+.fb-created { margin-left: auto; color: #6e7681; font-size: 0.78em; }
+.fb-note { white-space: pre-wrap; color: #c9d1d9; font-size: 0.9em; line-height: 1.5; }
+.fb-badge { font-size: 0.72em; font-weight: 600; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em; }
+.fb-badge-new { background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb55; }
+.fb-badge-triaged { background: #9e6a0333; color: #d29922; border: 1px solid #d2992255; }
+.fb-badge-done { background: #23863633; color: #3fb950; border: 1px solid #2ea04355; }
+.fb-untriaged { color: #6e7681; font-size: 0.8em; margin: 8px 0 0; font-style: italic; }
+.fb-triage { margin-top: 10px; }
+.fb-triage summary { cursor: pointer; color: #d29922; font-size: 0.82em; font-weight: 600; }
+.fb-triage pre { white-space: pre-wrap; word-break: break-word; background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 10px; margin: 8px 0 0; font-size: 0.82em; color: #c9d1d9; }
+.fb-badge-approved { background: #8957e533; color: #bc8cff; border: 1px solid #8957e555; }
+.fb-actions { display: flex; gap: 8px; margin-top: 12px; }
+.fb-btn { font-size: 0.8em; padding: 5px 14px; border-radius: 6px; border: 1px solid transparent; cursor: pointer; font-weight: 600; }
+.fb-approve { background: #238636; color: #fff; border-color: #2ea043; }
+.fb-approve:hover { background: #2ea043; }
+.fb-reject { background: #21262d; color: #f85149; border-color: #f8514955; }
+.fb-reject:hover { background: #4a1d1d; border-color: #f85149; }

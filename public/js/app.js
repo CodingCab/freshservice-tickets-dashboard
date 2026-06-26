@@ -5,6 +5,7 @@
 const BASE_URL = window.location.pathname.replace(/\/$/, '');
 const TICKETS_API = BASE_URL + '/api/tickets';
 const AGENTS_API = BASE_URL + '/api/agents';
+const FS_HEALTH_API = BASE_URL + '/api/health/freshservice';
 // window.taskListsTabHTML / window.loadTaskLists / window.mountTaskListsApp
 // are provided by the Vite-built Vue bundle (resources/js/app.js).
 
@@ -17,6 +18,53 @@ let currentFilter = 'active';
 let currentSort = 'category';
 let sortDir = 1;
 let currentTab = 'tickets';
+let showStarredOnly = false;
+
+// ─── Starred tickets (persisted in localStorage) ──────────────────
+// Operators star tickets they want quick access to. The "★ Starred only"
+// filter button at the top of the tickets table toggles a view that hides
+// everything else. The star icon also appears as the leftmost column on
+// each row and as a button in the Vue detail panel header; clicking either
+// toggles the state. State is a Set held in memory + persisted as a JSON
+// array under localStorage key STARRED_TICKETS_KEY.
+const STARRED_TICKETS_KEY = 'starred_tickets';
+function loadStarredTickets() {
+    try {
+        const raw = localStorage.getItem(STARRED_TICKETS_KEY);
+        if (!raw) return new Set();
+        const arr = JSON.parse(raw);
+        return new Set(Array.isArray(arr) ? arr.map(String) : []);
+    } catch (e) {
+        return new Set();
+    }
+}
+function saveStarredTickets(set) {
+    try {
+        localStorage.setItem(STARRED_TICKETS_KEY, JSON.stringify(Array.from(set)));
+    } catch (e) { /* quota / private mode — fail silently */ }
+}
+let starredTickets = loadStarredTickets();
+function isTicketStarred(id) { return starredTickets.has(String(id)); }
+function toggleTicketStar(id, event) {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+    const sid = String(id);
+    if (starredTickets.has(sid)) starredTickets.delete(sid);
+    else starredTickets.add(sid);
+    saveStarredTickets(starredTickets);
+    // Re-render the visible table so the row icon + the filter (if active) update.
+    if (typeof renderTable === 'function') renderTable();
+    // Tell the Vue detail panel (if open on this ticket) to refresh its star state.
+    if (typeof window.onTicketStarChanged === 'function') window.onTicketStarChanged(sid);
+}
+function toggleStarredOnlyFilter() {
+    showStarredOnly = !showStarredOnly;
+    const btn = document.getElementById('starredOnlyBtn');
+    if (btn) btn.classList.toggle('active', showStarredOnly);
+    renderTable();
+}
+// Expose to the Vue bundle (which calls toggleTicketStar from its star button).
+window.toggleTicketStar = toggleTicketStar;
+window.isTicketStarred = isTicketStarred;
 
 let agentSort = 'created_at';
 let agentSortDir = -1;
@@ -95,11 +143,16 @@ function renderApp() {
             <button class="page-tab active" data-page="tickets" onclick="switchTab('tickets')">Tickets</button>
             <button class="page-tab" data-page="agents" onclick="switchTab('agents')">Agents</button>
             <button class="page-tab" data-page="task-lists" onclick="switchTab('task-lists')">Task Lists</button>
+            <button class="page-tab" data-page="feedback" onclick="switchTab('feedback')">Feedback</button>
         </div>
 
         <div id="tickets-tab" class="tab-page">
             <div class="header">
                 <h1>FreshService Tickets</h1>
+                <button class="fs-health-badge fs-health-unknown" id="fsHealthBadge" onclick="openFsHealthModal()" title="FreshService connection health — click for details">
+                    <span class="fs-health-dot"></span>
+                    <span class="fs-health-label" id="fsHealthLabel">checking…</span>
+                </button>
                 <button class="refresh-btn" onclick="loadTickets()">&#x21bb; Refresh</button>
                 <a href="${TICKETS_API}" target="_blank" class="json-link">JSON</a>
                 <a href="/www/freshservice-tickets-db.json" target="_blank" class="json-link">DB File</a>
@@ -113,12 +166,15 @@ function renderApp() {
                 <button class="filter-btn" data-filter="open" onclick="setFilter('open')">Open</button>
                 <button class="filter-btn" data-filter="pending" onclick="setFilter('pending')">Pending</button>
                 <button class="filter-btn" data-filter="closed" onclick="setFilter('closed')">Closed</button>
+                <button class="filter-btn filter-btn-starred" id="starredOnlyBtn" onclick="toggleStarredOnlyFilter()" title="Show only tickets you have starred">★ Starred only</button>
             </div>
             <table>
                 <thead><tr>
+                    <th class="star-col" title="Star this ticket — toggles the per-row marker"></th>
                     <th onclick="sortBy('category')">Category <span class="sort-arrow" id="sort-category">&#x25B2;</span></th>
                     <th onclick="sortBy('id')">ID <span class="sort-arrow" id="sort-id"></span></th>
                     <th onclick="sortBy('status')">FreshService Status <span class="sort-arrow" id="sort-status"></span></th>
+                    <th onclick="sortBy('pipeline_section')">Pipeline Stage <span class="sort-arrow" id="sort-pipeline_section"></span></th>
                     <th onclick="sortBy('priority')">Priority <span class="sort-arrow" id="sort-priority"></span></th>
                     <th onclick="sortBy('subject')">Subject <span class="sort-arrow" id="sort-subject"></span></th>
                     <th onclick="sortBy('requester_name')">Requester <span class="sort-arrow" id="sort-requester_name"></span></th>
@@ -162,6 +218,15 @@ function renderApp() {
 
         ${taskListsTabHTML()}
 
+        <div id="feedback-tab" class="tab-page" style="display:none;">
+            <div class="header">
+                <h1>Automation Feedback</h1>
+                <button class="refresh-btn" onclick="loadFeedback()">&#x21bb; Refresh</button>
+            </div>
+            <p class="feedback-intro">Reports filed from a ticket panel about how the automation handled a ticket. Flow: <strong>New</strong> → <strong>Triaged</strong> (proposal ready) → <strong>Done</strong>.</p>
+            <div id="feedbackContainer"><p class="feedback-empty">Loading…</p></div>
+        </div>
+
         <div class="modal" id="agentModal">
             <div class="modal-content">
                 <div class="modal-header">
@@ -176,6 +241,16 @@ function renderApp() {
                     <pre id="modalPrompt" class="mtab-content active"></pre>
                     <div id="modalOutput" class="mtab-content output-formatted"></div>
                 </div>
+            </div>
+        </div>
+
+        <div class="modal" id="fsHealthModal">
+            <div class="modal-content fs-health-modal-content">
+                <div class="modal-header">
+                    <h2>FreshService Connection Health</h2>
+                    <button class="modal-close" onclick="closeFsHealthModal()">&times;</button>
+                </div>
+                <div class="modal-body" id="fsHealthModalBody"></div>
             </div>
         </div>
     `;
@@ -208,9 +283,97 @@ function switchTab(tab, updateHash = true) {
     document.getElementById('tickets-tab').style.display = tab === 'tickets' ? '' : 'none';
     document.getElementById('agents-tab').style.display = tab === 'agents' ? '' : 'none';
     document.getElementById('task-lists-tab').style.display = tab === 'task-lists' ? '' : 'none';
+    const fbTab = document.getElementById('feedback-tab');
+    if (fbTab) fbTab.style.display = tab === 'feedback' ? '' : 'none';
     if (tab === 'agents' && agentTasks.length === 0) loadAgents();
     if (tab === 'task-lists') loadTaskLists();
+    if (tab === 'feedback') loadFeedback();
     if (updateHash) window.location.hash = tab === 'tickets' ? '' : tab;
+}
+
+// ─── Automation Feedback ────────────────────────────────────────
+
+function escFb(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function loadFeedback() {
+    const c = document.getElementById('feedbackContainer');
+    if (!c) return;
+    c.innerHTML = '<p class="feedback-empty">Loading…</p>';
+    try {
+        const resp = await fetch('/api/automation-feedback');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        renderFeedback(data.feedback || []);
+    } catch (e) {
+        c.innerHTML = '<p class="feedback-empty">Failed to load: ' + escFb(e.message || e) + '</p>';
+    }
+}
+
+function renderFeedback(items) {
+    const c = document.getElementById('feedbackContainer');
+    if (!c) return;
+    if (!items.length) {
+        c.innerHTML = '<p class="feedback-empty">No feedback yet. Use the ⚑ Report automation issue button on any ticket.</p>';
+        return;
+    }
+    const badge = (st) => {
+        const k = String(st || '').toLowerCase();
+        const cls = k.includes('triag') ? 'fb-badge-triaged'
+            : k.includes('approv') ? 'fb-badge-approved'
+            : k.includes('done') ? 'fb-badge-done'
+            : 'fb-badge-new';
+        return '<span class="fb-badge ' + cls + '">' + escFb(st || 'New') + '</span>';
+    };
+    c.innerHTML = items.map(it => {
+        const tlink = it.ticket_url
+            ? '<a href="' + escFb(it.ticket_url) + '" target="_blank">' + escFb(it.ticket || '') + '</a>'
+            : escFb(it.ticket || '');
+        const triage = it.triage
+            ? '<details class="fb-triage"><summary>Triage proposal</summary><pre>' + escFb(it.triage) + '</pre></details>'
+            : '<p class="fb-untriaged">Not triaged yet.</p>';
+        const isTriaged = String(it.status || '').toLowerCase().includes('triag');
+        const actions = isTriaged
+            ? '<div class="fb-actions">'
+                + '<button class="fb-btn fb-approve" onclick="approveFeedback(\'' + escFb(it.id) + '\')">Approve</button>'
+                + '<button class="fb-btn fb-reject" onclick="rejectFeedback(\'' + escFb(it.id) + '\')">Reject</button>'
+                + '</div>'
+            : '';
+        return '<div class="fb-card">'
+            + '<div class="fb-card-head">' + badge(it.status)
+            + ' <span class="fb-ticket">' + tlink + '</span>'
+            + '<span class="fb-created">' + escFb(it.created || '') + '</span></div>'
+            + '<div class="fb-note">' + escFb(it.note || '') + '</div>'
+            + triage
+            + actions
+            + '</div>';
+    }).join('');
+}
+
+async function approveFeedback(id) {
+    if (!confirm('Approve this proposal? It moves to "Approved — to implement".')) return;
+    await feedbackDecision(id, 'approve', {});
+}
+async function rejectFeedback(id) {
+    const reason = prompt('Reject this feedback — optional reason:');
+    if (reason === null) return; // cancelled
+    await feedbackDecision(id, 'reject', { reason: reason });
+}
+async function feedbackDecision(id, action, body) {
+    try {
+        const resp = await fetch('/api/automation-feedback/' + encodeURIComponent(id) + '/' + action, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify(body || {}),
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        await resp.json();
+        loadFeedback();
+    } catch (e) {
+        alert('Failed: ' + (e.message || e));
+    }
 }
 
 // ─── Tickets data fetching ──────────────────────────────────────
@@ -222,6 +385,8 @@ async function loadTickets() {
         tickets = Object.values(db.tickets || {}).map(t => {
             const fs = t.freshservice || {};
             fs._internal = t.internal || {};
+            // Mirror pipeline_section to top-level so sortBy('pipeline_section') works.
+            fs.pipeline_section = fs._internal.pipeline_section || '';
             return fs;
         });
         document.getElementById('lastUpdated').textContent = 'Last synced: ' + (db.last_synced || 'unknown');
@@ -229,7 +394,7 @@ async function loadTickets() {
         renderTable();
     } catch (e) {
         document.getElementById('ticketBody').innerHTML =
-            '<tr><td colspan="11" class="empty">Failed to load tickets: ' + e.message + '</td></tr>';
+            '<tr><td colspan="12" class="empty">Failed to load tickets: ' + e.message + '</td></tr>';
     }
 }
 
@@ -251,8 +416,28 @@ async function loadAgents() {
 
 // ─── Ticket Stats ───────────────────────────────────────────────
 
+// A ticket is "internally parked" when our pipeline has moved it to a
+// terminal section. The pipeline is the canonical source of truth — our
+// sections decide what shows where. External channel state (FreshService
+// status, future Gmail / WhatsApp / etc.) is just input that feeds our
+// channel-side handlers (OnCustomerReplied, OnTicketClosed, watchdog spam
+// routing); those handlers translate channel events into pipeline section
+// changes. The dashboard trusts the pipeline_section directly — no
+// defensive cross-check against channel-specific status codes, because
+// that would make the pipeline depend on whichever channel happens to be
+// in use today.
+//
+// If a customer reply reopens a ticket we had marked Closed, the pipeline
+// reacts via the OnCustomerReplied handler which moves the ticket out of
+// ## Closed. If that handler ever fails to fire, that's a pipeline bug to
+// fix at the source — not a defensive filter to add here.
+function isInternallyParked(t) {
+    const sec = (t._internal && t._internal.pipeline_section) || '';
+    return sec === 'Spam' || sec === 'Closed';
+}
+
 function renderStats() {
-    const active = tickets.filter(t => [2, 3, 10].includes(t.status) && !t.deleted);
+    const active = tickets.filter(t => [2, 3, 10].includes(t.status) && !t.deleted && !isInternallyParked(t));
     const open = active.filter(t => t.status === 2);
     const pending = active.filter(t => t.status === 3);
     const categories = {};
@@ -294,6 +479,13 @@ function renderAgentStats() {
 function getFiltered() {
     const search = document.getElementById('search').value.toLowerCase();
     return tickets.filter(t => {
+        // Starred-only filter is layered ON TOP of the status filter — when
+        // active, the status filter still applies, but only starred tickets
+        // pass the gate.
+        if (showStarredOnly && !isTicketStarred(t.id)) return false;
+        // Internally-parked tickets (## Spam, ## Closed) never show in Active /
+        // Open / Pending — that's the whole point of those sections.
+        if (['active', 'open', 'pending'].includes(currentFilter) && isInternallyParked(t)) return false;
         if (currentFilter === 'active') { if (![2, 3, 10].includes(t.status) || t.deleted) return false; }
         else if (currentFilter === 'open') { if (t.status !== 2 || t.deleted) return false; }
         else if (currentFilter === 'pending') { if (t.status !== 3 || t.deleted) return false; }
@@ -317,7 +509,7 @@ function renderTable() {
     });
 
     if (!filtered.length) {
-        document.getElementById('ticketBody').innerHTML = '<tr><td colspan="11" class="empty">No tickets found</td></tr>';
+        document.getElementById('ticketBody').innerHTML = '<tr><td colspan="13" class="empty">No tickets found</td></tr>';
         return;
     }
 
@@ -327,10 +519,18 @@ function renderTable() {
         const prioClass = (PRIORITY_MAP[t.priority] || '').toLowerCase();
         const created = t.created_at ? new Date(t.created_at).toLocaleDateString('en-IE', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
         const updated = t.updated_at ? new Date(t.updated_at).toLocaleDateString('en-IE', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
-        return `<tr>
+        const pipelineSection = t._internal.pipeline_section || '';
+        const pipelineSlug = pipelineSection.toLowerCase().replace(/[^a-z]+/g, '-').replace(/(^-|-$)/g, '');
+        const starred = isTicketStarred(t.id);
+        return `<tr${starred ? ' class="row-starred"' : ''}>
+            <td class="star-col"><span class="ticket-star ${starred ? 'starred' : ''}" onclick="toggleTicketStar('${t.id}', event)" title="${starred ? 'Unstar' : 'Star this ticket'}">${starred ? '★' : '☆'}</span></td>
             <td><span class="category category-${catClass}">${t.category || '-'}</span></td>
-            <td><a href="https://youritsolutions.freshservice.com/a/tickets/${t.id}" target="_blank">#${t.id}</a></td>
+            <td>
+                <a href="https://youritsolutions.freshservice.com/a/tickets/${t.id}" target="_blank">#${t.id}</a>
+                <a href="#" class="ticket-detail-link" onclick="openTicketDetailFromTable(event, '${t.id}')" title="Open inline detail viewer">Details</a>
+            </td>
             <td><span class="badge badge-${statusClass}">${STATUS_MAP[t.status] || t.status}</span></td>
+            <td class="pipeline-stage">${pipelineSection ? `<span class="badge badge-stage badge-stage-${pipelineSlug}">${esc(pipelineSection)}</span>` : '<span class="badge badge-stage-none">—</span>'}</td>
             <td class="priority-${prioClass}">${PRIORITY_MAP[t.priority] || t.priority}</td>
             <td class="subject" title="${esc(t.subject)}">${esc(t.subject)}</td>
             <td class="requester" title="${esc(t.requester_name)}">${esc(t.requester_name)}</td>
@@ -341,6 +541,22 @@ function renderTable() {
             <td>${t._internal.ticket_file ? '<a href="' + t._internal.ticket_file + '" target="_blank">View</a>' : ''}</td>
         </tr>`;
     }).join('');
+}
+
+// ─── Ticket Detail viewer (Vue) ─────────────────────────────────
+// The "Details" link in each ticket row calls into here. The Vue bundle
+// (resources/js/app.js) exposes window.openTicketDetail(id).
+
+function openTicketDetailFromTable(event, ticketId) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    if (typeof window.openTicketDetail === 'function') {
+        window.openTicketDetail(ticketId);
+    } else {
+        console.warn('openTicketDetail not available; Vue bundle not loaded?');
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -626,7 +842,7 @@ function agentSortBy(col) {
 
 renderApp();
 
-const VALID_TABS = ['tickets', 'agents', 'task-lists'];
+const VALID_TABS = ['tickets', 'agents', 'task-lists', 'feedback'];
 const initialTab = window.location.hash.replace('#', '') || 'tickets';
 if (VALID_TABS.includes(initialTab)) switchTab(initialTab, false);
 window.addEventListener('hashchange', () => {
@@ -635,8 +851,131 @@ window.addEventListener('hashchange', () => {
 });
 
 loadTickets();
-setInterval(loadTickets, 5 * 60 * 1000);
-setInterval(loadAgents, 60 * 1000);
+// Auto-refresh the ACTIVE tab every 30s so the panel always shows current data.
+// Skipped while the browser tab is hidden, to avoid pointless background fetches.
+setInterval(() => {
+    if (document.hidden) return;
+    if (currentTab === 'tickets') loadTickets();
+    else if (currentTab === 'agents') loadAgents();
+    else if (currentTab === 'feedback') loadFeedback();
+    else if (currentTab === 'task-lists') loadTaskLists();
+}, 30 * 1000);
 
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeAgentModal(); });
+// ─── FreshService connection health ─────────────────────────────
+
+let fsHealthData = null;
+
+async function loadFsHealth() {
+    try {
+        const resp = await fetch(FS_HEALTH_API + '?t=' + Date.now());
+        fsHealthData = await resp.json();
+    } catch (e) {
+        fsHealthData = {
+            status: 'failed',
+            tested_at: null,
+            summary: 'Could not reach /api/health/freshservice: ' + e.message,
+            checks: {},
+            age_seconds: null,
+        };
+    }
+    renderFsHealthBadge();
+    // If the modal is open, refresh its body too.
+    if (document.getElementById('fsHealthModal')?.classList.contains('open')) {
+        renderFsHealthModalBody();
+    }
+}
+
+function renderFsHealthBadge() {
+    const badge = document.getElementById('fsHealthBadge');
+    const label = document.getElementById('fsHealthLabel');
+    if (!badge || !label || !fsHealthData) return;
+    badge.classList.remove('fs-health-ok', 'fs-health-fail', 'fs-health-unknown');
+    if (fsHealthData.status === 'ok') {
+        badge.classList.add('fs-health-ok');
+        label.textContent = 'FS OK';
+    } else {
+        badge.classList.add('fs-health-fail');
+        label.textContent = 'FS error';
+    }
+}
+
+function openFsHealthModal() {
+    const modal = document.getElementById('fsHealthModal');
+    if (!modal) return;
+    renderFsHealthModalBody();
+    modal.classList.add('open');
+}
+
+function closeFsHealthModal() {
+    document.getElementById('fsHealthModal')?.classList.remove('open');
+}
+
+function renderFsHealthModalBody() {
+    const body = document.getElementById('fsHealthModalBody');
+    if (!body) return;
+    if (!fsHealthData) {
+        body.innerHTML = '<p>Loading…</p>';
+        return;
+    }
+    const d = fsHealthData;
+    const ageLine = d.age_seconds == null ? ''
+        : `<p class="fs-health-age">Result is ${d.age_seconds}s old (cron runs every 30 min)</p>`;
+    const statusBanner = d.status === 'ok'
+        ? '<div class="fs-health-banner fs-health-banner-ok">All checks passed</div>'
+        : `<div class="fs-health-banner fs-health-banner-fail">${escapeHtml(d.summary || 'Failed')}</div>`;
+    const checks = d.checks || {};
+    const rows = Object.entries(checks).map(([name, c]) => {
+        const ok = c.ok ? '✓' : '✗';
+        const cls = c.ok ? 'fs-check-ok' : 'fs-check-fail';
+        const detail = formatCheckDetail(name, c);
+        return `
+            <div class="fs-check-row ${cls}">
+                <div class="fs-check-name"><span class="fs-check-mark">${ok}</span> ${escapeHtml(humanCheckName(name))}</div>
+                <div class="fs-check-detail">${detail}</div>
+            </div>`;
+    }).join('');
+    body.innerHTML = `
+        ${statusBanner}
+        <p class="fs-health-tested-at">Tested at: <code>${escapeHtml(d.tested_at || 'never')}</code></p>
+        ${ageLine}
+        <div class="fs-check-list">${rows || '<p>No checks ran.</p>'}</div>
+        <p class="fs-health-source">Source: <code>${escapeHtml(d.file_path || '/shared/state/fs-connection-health.json')}</code> · written by <code>/shared/scripts/fs-connection-test.py</code></p>
+    `;
+}
+
+function humanCheckName(name) {
+    return ({
+        'api_reachable': 'FreshService API reachable',
+        'sync_recent': 'Ticket sync ran recently',
+        'events_poller_recent': 'Events poller ran recently',
+    })[name] || name;
+}
+
+function formatCheckDetail(name, c) {
+    if (c.ok) {
+        if (name === 'api_reachable') return `OK (${c.duration_ms}ms)`;
+        if (name === 'sync_recent') return `Last sync: ${escapeHtml(c.last_synced)} (${c.age_seconds}s ago)`;
+        if (name === 'events_poller_recent') return `Last run: ${escapeHtml(c.last_run)} (${c.age_seconds}s ago)`;
+        return 'OK';
+    }
+    return `<span class="fs-check-error">${escapeHtml(c.error || 'Unknown error')}</span>`;
+}
+
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[ch]));
+}
+
+loadFsHealth();
+setInterval(loadFsHealth, 5 * 60 * 1000);  // refresh every 5 min on the page (cron writes every 30 min)
+
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+        closeAgentModal();
+        closeFsHealthModal();
+    }
+});
 document.getElementById('agentModal')?.addEventListener('click', e => { if (e.target.id === 'agentModal') closeAgentModal(); });
+document.getElementById('fsHealthModal')?.addEventListener('click', e => { if (e.target.id === 'fsHealthModal') closeFsHealthModal(); });
