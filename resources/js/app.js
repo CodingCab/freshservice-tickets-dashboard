@@ -26,6 +26,28 @@ import TicketDetail from './components/TicketDetail.vue';
 import TicketActions from './components/TicketActions.vue';
 import ReplyDraftModal from './components/ReplyDraftModal.vue';
 
+/*
+ * Base-path shim for subdirectory deployment (e.g. /www/tickets).
+ *
+ * Components and the legacy public/js/app.js issue API calls as root-absolute
+ * '/api/...' paths. Under a subdirectory mount those escape the app root and
+ * hit the parent host instead, returning HTML (so JSON.parse fails with
+ * "Unexpected token '<'"). Here we wrap window.fetch once — before any
+ * component or the deferred legacy script runs — to prepend the app base,
+ * matching public/js/app.js's BASE_URL = location.pathname convention.
+ */
+const __API_BASE = window.location.pathname.replace(/\/$/, '');
+if (__API_BASE && !window.__apiBaseShimInstalled) {
+    window.__apiBaseShimInstalled = true;
+    const __origFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+        if (typeof input === 'string' && input.indexOf('/api/') === 0) {
+            input = __API_BASE + input;
+        }
+        return __origFetch(input, init);
+    };
+}
+
 let _mountedVm = null;
 
 function mountTaskListsApp() {
