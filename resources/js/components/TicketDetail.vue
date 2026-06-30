@@ -302,7 +302,7 @@
                             class="td-initial-body-wrap"
                             :class="{ 'td-initial-collapsed': !initialMessageExpanded }"
                         >
-                            <div v-if="data.body_html" class="td-body-text td-html" v-html="data.body_html"></div>
+                            <div v-if="data.body_html" class="td-body-text td-html" v-html="withApiBase(data.body_html)"></div>
                             <div v-else class="td-body-text">
                                 <template v-for="(seg, i) in renderSegments(data.body)" :key="i">
                                     <pre v-if="seg.type === 'text'" class="td-body-para">{{ seg.value }}</pre>
@@ -458,7 +458,7 @@
                                 </div>
                             </div>
                             <div class="td-reply-body">
-                                <div v-if="r.body_html" class="td-html" v-html="r.body_html"></div>
+                                <div v-if="r.body_html" class="td-html" v-html="withApiBase(r.body_html)"></div>
                                 <template v-else v-for="(seg, i) in renderSegments(r.body)" :key="i">
                                     <p v-if="seg.type === 'text'">{{ seg.value }}</p>
                                     <div v-else-if="seg.type === 'image'" class="td-reply-img-wrap">
@@ -1489,8 +1489,19 @@ export default {
             return head;
         },
         attachmentUrl(filename) {
-            return '/api/tickets/' + encodeURIComponent(this.ticketId)
+            const base = window.__API_BASE || '';
+            return base + '/api/tickets/' + encodeURIComponent(this.ticketId)
                 + '/attachment/' + encodeURIComponent(filename);
+        },
+        // Server-enriched HTML (description / reply bodies) carries inline
+        // `<img src="/api/tickets/.../attachment/...">`. The browser loads those
+        // directly, bypassing the fetch() base-path shim, so under a
+        // subdirectory mount (e.g. /www/tickets) they escape the app root and
+        // 404. Prefix the app base onto every /api/ src+href before rendering.
+        withApiBase(html) {
+            const base = window.__API_BASE || '';
+            if (!html || !base) return html;
+            return String(html).replace(/(src|href)="\/api\//g, '$1="' + base + '/api/');
         },
         isImage(filename) {
             return /\.(png|jpe?g|gif|webp|svg)$/i.test(filename || '');

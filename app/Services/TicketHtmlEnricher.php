@@ -418,7 +418,11 @@ class TicketHtmlEnricher
         }
 
         $attachmentId = null;
-        if (str_contains($src, 'attachment.freshservice.com')
+        // Freshworks serves inline attachments from two CDN hosts —
+        // attachment.freshservice.com and attachment.freshdesk.com — depending
+        // on the channel the message came through. Both carry the same JWT
+        // token whose payload holds the numeric attachment id.
+        if ((str_contains($src, 'attachment.freshservice.com') || str_contains($src, 'attachment.freshdesk.com'))
             && preg_match('/[?&]token=([A-Za-z0-9._\-]+)/', $src, $m)
         ) {
             $parts = explode('.', $m[1]);
