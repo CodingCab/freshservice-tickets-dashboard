@@ -139,6 +139,40 @@ class TicketActionController extends Controller
         $toEmail = $this->extractEmail($toRaw);
         $ccEmails = $this->extractEmails($ccRaw);
 
+        // CC override — the panel lets the operator edit / add CC recipients
+        // before sending. When the request carries a `cc` field we use it
+        // verbatim (a present-but-empty value means "send with no CC"); when
+        // the field is absent we keep the draft's recorded CC list. Each
+        // address is validated so a typo is reported back rather than silently
+        // dropped.
+        if ($request->has('cc')) {
+            $ccInput = $request->input('cc');
+            $ccInputRaw = is_array($ccInput) ? implode(', ', $ccInput) : (string) $ccInput;
+            $tokens = preg_split('/[,;\n]+/', $ccInputRaw) ?: [];
+            $invalid = [];
+            $ccEmails = [];
+            foreach ($tokens as $tok) {
+                $tok = trim($tok);
+                if ($tok === '') {
+                    continue;
+                }
+                $email = $this->extractEmail($tok);
+                if ($email === '') {
+                    $invalid[] = $tok;
+                } else {
+                    $ccEmails[] = $email;
+                }
+            }
+            if (!empty($invalid)) {
+                return response()->json([
+                    'error' => 'invalid_cc',
+                    'invalid' => $invalid,
+                    'message' => 'These CC addresses are not valid: ' . implode(', ', $invalid),
+                ], 422);
+            }
+            $ccEmails = array_values(array_unique($ccEmails));
+        }
+
         $meta = $ticketFile->getMetadata();
         $requesterRaw = $meta['Requester'] ?? '';
         $requesterEmail = $this->extractEmail($requesterRaw);

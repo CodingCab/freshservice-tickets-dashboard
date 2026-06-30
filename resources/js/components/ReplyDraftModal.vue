@@ -1,5 +1,5 @@
 <template>
-    <div v-if="isOpen" class="rdm-overlay" @click.self="cancel">
+    <div v-if="isOpen" class="rdm-overlay">
         <div class="rdm-dialog" role="dialog" aria-modal="true" aria-label="Confirm send reply">
             <header class="rdm-header">
                 <h2 class="rdm-title">Reply draft &mdash; {{ ticketId }}</h2>
@@ -28,9 +28,18 @@
                         <template v-if="draft.created_at">
                             <dt>Created</dt><dd>{{ formattedCreatedAt }}</dd>
                         </template>
-                        <template v-if="draft.cc && !ccIsEmpty">
-                            <dt>CC</dt><dd>{{ draft.cc }}</dd>
-                        </template>
+                        <dt>CC</dt>
+                        <dd>
+                            <input
+                                type="text"
+                                class="rdm-cc-input"
+                                v-model="editCc"
+                                :disabled="sending || !!sendSuccess || alreadySent"
+                                placeholder="Add CC recipients, comma-separated"
+                                spellcheck="false"
+                                autocomplete="off"
+                            />
+                        </dd>
                         <template v-if="draft.subject">
                             <dt>Subject</dt><dd>{{ draft.subject }}</dd>
                         </template>
@@ -122,6 +131,7 @@ export default {
             loadError: '',
             draft: null,
             editBody: '',
+            editCc: '',
             sending: false,
             sendError: '',
             sendSuccess: null,
@@ -140,6 +150,10 @@ export default {
             const cc = (this.draft && this.draft.cc) || '';
             const norm = cc.trim().toLowerCase();
             return norm === '' || norm === '—' || norm === '_(none)_' || norm === '(none)';
+        },
+        originalCc() {
+            if (!this.draft) return '';
+            return this.ccIsEmpty ? '' : String(this.draft.cc || '').trim();
         },
         formattedCreatedAt() {
             const iso = this.draft && this.draft.created_at ? this.draft.created_at : '';
@@ -170,6 +184,7 @@ export default {
             this.loadError = '';
             this.draft = null;
             this.editBody = '';
+            this.editCc = '';
             this.sendError = '';
             this.sendSuccess = null;
             this.sending = false;
@@ -185,6 +200,7 @@ export default {
                 const data = await resp.json();
                 this.draft = data && data.reply_draft ? data.reply_draft : null;
                 this.editBody = this.draft && this.draft.body_markdown ? this.draft.body_markdown : '';
+                this.editCc = this.originalCc;
                 if (!this.draft) {
                     this.loadError = 'no draft for this ticket';
                 }
@@ -215,6 +231,11 @@ export default {
             if (code === 'bad_filename') return "Can't send — the ticket filename is malformed.";
             if (code === 'draft_not_found' || code === 'no_draft' || code === 'reply_draft_not_found') return "Can't send — no reply draft was found for this ticket.";
             if (code === 'already_sent') return 'This reply has already been sent.';
+            if (code === 'invalid_cc') {
+                return (body && body.message)
+                    ? body.message
+                    : 'One or more CC addresses are not valid email addresses.';
+            }
             if (code === 'requester_mismatch') {
                 return (body && body.message)
                     ? body.message
@@ -231,7 +252,9 @@ export default {
                 // otherwise send {} so the backend uses the original draft file
                 // verbatim (no rendering drift for the untouched case).
                 const original = (this.draft && this.draft.body_markdown ? this.draft.body_markdown : '').trim();
-                const payload = this.editBody.trim() !== original ? { body: this.editBody } : {};
+                const payload = {};
+                if (this.editBody.trim() !== original) payload.body = this.editBody;
+                if (this.editCc.trim() !== this.originalCc) payload.cc = this.editCc.trim();
                 if (overrideMismatch) payload.confirm_requester_mismatch = true;
                 const resp = await fetch(
                     '/api/tickets/' + encodeURIComponent(this.ticketId) + '/send-reply',
@@ -340,6 +363,20 @@ export default {
 }
 .rdm-meta dt { color: #c9d1d9; font-weight: 700; }
 .rdm-meta dd { margin: 0; color: #8b949e; word-break: break-word; }
+.rdm-cc-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-family: inherit;
+    font-size: 12.5px;
+    color: #c9d1d9;
+}
+.rdm-cc-input:focus { outline: none; border-color: #1f6feb; }
+.rdm-cc-input:disabled { opacity: 0.6; }
+.rdm-cc-input::placeholder { color: #6e7681; }
 
 .rdm-preview-label {
     font-size: 12px;
