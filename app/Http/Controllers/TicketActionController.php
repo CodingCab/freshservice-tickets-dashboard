@@ -1134,11 +1134,23 @@ class TicketActionController extends Controller
         }
         $targetCode = $statusMap[$targetName];
         $targetLabel = ucfirst($targetName);
+        $marker = $targetName === 'closed'
+            ? 'Ticket closed via dashboard'
+            : 'Ticket status changed via dashboard';
 
         $file = TicketFile::find($ticketId);
         if ($file === null) {
             return response()->json(['error' => 'ticket_file_not_found'], 404);
         }
+
+        // Section the entry currently lives in — computed once up front so it
+        // is available both for the idempotent short-circuit and for the final
+        // response payload. (It was previously only assigned inside the
+        // idempotent branch, so the normal path threw an "undefined variable"
+        // error when building the response — AFTER the FS status change and
+        // section move had already happened, surfacing as a spurious HTTP 500
+        // on a ticket that was in fact closed correctly.)
+        $currentSection = $this->currentSection($ticketId);
 
         $reason = trim((string) $request->input('reason', ''));
         if (mb_strlen($reason) > 500) {
@@ -1188,7 +1200,6 @@ class TicketActionController extends Controller
             // (otherwise a "Send to Closed" click on a ticket that's
             // already Closed on FS would silently no-op while the entry
             // sat in some non-Closed section forever).
-            $currentSection = $this->currentSection($ticketId);
             if ($targetName === 'closed' && $currentSection !== 'Closed') {
                 try {
                     $this->moveToSection($file->getPath(), 'Closed');
