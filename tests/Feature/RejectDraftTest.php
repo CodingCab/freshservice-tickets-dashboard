@@ -148,7 +148,7 @@ class RejectDraftTest extends TestCase
     {
         $response = $this->postJson(
             "/api/tickets/{$this->ticketId}/reject-draft",
-            ['feedback' => str_repeat('a', 501)]
+            ['feedback' => str_repeat('a', 2001)]
         );
         $response->assertStatus(422);
         $response->assertJsonPath('error', 'validation_failed');
