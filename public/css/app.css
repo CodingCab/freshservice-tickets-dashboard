@@ -255,3 +255,12 @@ a:hover { text-decoration: underline; }
 .fb-approve:hover { background: #2ea043; }
 .fb-reject { background: #21262d; color: #f85149; border-color: #f8514955; }
 .fb-reject:hover { background: #4a1d1d; border-color: #f85149; }
+
+/* ─── AI Sessions tab ─────────────────────────────────────────── */
+.ai-badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.72em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.ai-badge-live { background: #1a3a4d; color: #58a6ff; }
+.ai-badge-ended { background: #2d2d2d; color: #8b949e; }
+.ai-badge-orphan { background: #5a1620; color: #ff7b72; border: 1px solid #f8514966; }
+.ai-orphan-row { background: #2d1114; }
+.ai-orphan-row:hover { background: #3a161b; }
+.ai-orphan-row td { color: #f0b6b2; }

@@ -250,6 +250,76 @@ class TicketsController extends Controller
     }
 
     /**
+     * AI Sessions — merge the per-user Claude Code session snapshots written by
+     * bin/collect-ai-sessions.py (each user must collect their own because
+     * ~/.claude is mode 0700). Returns the flattened session list plus summary
+     * counters. Read-only; scope is live sessions + anything active in the last
+     * 24h. See bin/collect-ai-sessions.py for the field contract.
+     */
+    public function aiSessions()
+    {
+        $dir = storage_path('ai-sessions');
+        $sessions = [];
+        $collectedAt = null;
+
+        foreach (glob($dir . '/*.json') ?: [] as $file) {
+            if (!is_readable($file)) continue;
+            $data = @json_decode(file_get_contents($file), true);
+            if (!is_array($data) || !isset($data['sessions']) || !is_array($data['sessions'])) continue;
+            $user = $data['user'] ?? pathinfo($file, PATHINFO_FILENAME);
+            $userCollected = $data['collected_at'] ?? null;
+            if ($userCollected && (!$collectedAt || strcmp($userCollected, $collectedAt) > 0)) {
+                $collectedAt = $userCollected;
+            }
+            foreach ($data['sessions'] as $s) {
+                if (!is_array($s)) continue;
+                $s['user'] = $user;
+                $s['user_collected_at'] = $userCollected;
+                $sessions[] = $s;
+            }
+        }
+
+        // Summary counters.
+        $liveCount = 0;
+        $orphanCount = 0;
+        $tokens24h = 0;
+        foreach ($sessions as $s) {
+            if (($s['status'] ?? '') === 'live') {
+                $liveCount++;
+                if (!empty($s['orphan'])) $orphanCount++;
+            }
+            $t = $s['tokens'] ?? [];
+            $tokens24h += ($t['input'] ?? 0) + ($t['output'] ?? 0)
+                + ($t['cache_read'] ?? 0) + ($t['cache_write'] ?? 0);
+        }
+
+        // Orphans first, then live, then by runtime desc, ended last.
+        usort($sessions, function ($a, $b) {
+            $rank = function ($s) {
+                if (($s['status'] ?? '') === 'live') {
+                    return !empty($s['orphan']) ? 0 : 1;
+                }
+                return 2;
+            };
+            $ra = $rank($a);
+            $rb = $rank($b);
+            if ($ra !== $rb) return $ra - $rb;
+            return (int)($b['runtime_seconds'] ?? 0) - (int)($a['runtime_seconds'] ?? 0);
+        });
+
+        return response()->json([
+            'sessions'     => $sessions,
+            'collected_at' => $collectedAt,
+            'summary'      => [
+                'live'        => $liveCount,
+                'orphans'     => $orphanCount,
+                'tokens_24h'  => $tokens24h,
+                'users'       => count(glob($dir . '/*.json') ?: []),
+            ],
+        ]);
+    }
+
+    /**
      * Agent task output — returns the output file content for a given task.
      */
     public function agentOutput(string $id)

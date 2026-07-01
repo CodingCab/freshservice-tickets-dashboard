@@ -8,6 +8,7 @@ Route::get('/', [TicketsController::class, 'index']);
 Route::get('/api/tickets', [TicketsController::class, 'api']);
 Route::get('/api/health/freshservice', [TicketsController::class, 'health']);
 Route::get('/api/agents', [TicketsController::class, 'agents']);
+Route::get('/api/ai-sessions', [TicketsController::class, 'aiSessions']);
 Route::get('/api/automation-feedback', [TicketsController::class, 'automationFeedback']);
 Route::get('/api/agents/{id}/output', [TicketsController::class, 'agentOutput']);
 

@@ -6,6 +6,7 @@ const BASE_URL = window.location.pathname.replace(/\/$/, '');
 const TICKETS_API = BASE_URL + '/api/tickets';
 const AGENTS_API = BASE_URL + '/api/agents';
 const FS_HEALTH_API = BASE_URL + '/api/health/freshservice';
+const AI_SESSIONS_API = BASE_URL + '/api/ai-sessions';
 // window.taskListsTabHTML / window.loadTaskLists / window.mountTaskListsApp
 // are provided by the Vite-built Vue bundle (resources/js/app.js).
 
@@ -144,6 +145,7 @@ function renderApp() {
             <button class="page-tab" data-page="agents" onclick="switchTab('agents')">Agents</button>
             <button class="page-tab" data-page="task-lists" onclick="switchTab('task-lists')">Task Lists</button>
             <button class="page-tab" data-page="feedback" onclick="switchTab('feedback')">Feedback</button>
+            <button class="page-tab" data-page="ai-sessions" onclick="switchTab('ai-sessions')">AI Sessions</button>
         </div>
 
         <div id="tickets-tab" class="tab-page">
@@ -227,6 +229,42 @@ function renderApp() {
             <div id="feedbackContainer"><p class="feedback-empty">Loading…</p></div>
         </div>
 
+        <div id="ai-sessions-tab" class="tab-page" style="display:none;">
+            <div class="header">
+                <h1>AI Sessions</h1>
+                <button class="refresh-btn" onclick="loadAiSessions()">&#x21bb; Refresh</button>
+                <a href="${AI_SESSIONS_API}" target="_blank" class="json-link">JSON</a>
+                <span class="last-updated" id="aiSessionsLastSynced"></span>
+            </div>
+            <p class="feedback-intro">Live Claude Code sessions across all users plus anything active in the last 24h. <strong>Activity</strong>: active (&lt;30m) · idle (30m–6h) · <strong>dormant</strong> (no activity 6h+) · <strong>looping</strong> (still active after 8h+). An <strong>ORPHAN</strong> is a live session backed by neither a terminal tab nor the Studio panel.</p>
+            <div class="stats" id="aiSessionsStats"></div>
+            <div class="filters">
+                <input type="text" id="aiSessionsSearch" placeholder="Search sessions..." oninput="renderAiSessions()">
+                <button class="filter-btn active" data-ai-filter="all" onclick="setAiSessionsFilter('all')">All</button>
+                <button class="filter-btn" data-ai-filter="live" onclick="setAiSessionsFilter('live')">Live</button>
+                <button class="filter-btn" data-ai-filter="active" onclick="setAiSessionsFilter('active')">Active</button>
+                <button class="filter-btn" data-ai-filter="dormant" onclick="setAiSessionsFilter('dormant')">Dormant</button>
+                <button class="filter-btn" data-ai-filter="looping" onclick="setAiSessionsFilter('looping')">Looping</button>
+                <button class="filter-btn" data-ai-filter="orphan" onclick="setAiSessionsFilter('orphan')">Orphans</button>
+                <button class="filter-btn" data-ai-filter="ended" onclick="setAiSessionsFilter('ended')">Ended (24h)</button>
+            </div>
+            <div class="table-wrap">
+                <table id="aiSessionsTable">
+                    <thead><tr>
+                        <th>User</th>
+                        <th>PID</th>
+                        <th>Model</th>
+                        <th>Runtime</th>
+                        <th>Tokens (out / cache-read)</th>
+                        <th>Activity</th>
+                        <th>Attached to</th>
+                        <th>Status</th>
+                    </tr></thead>
+                    <tbody id="aiSessionsBody"></tbody>
+                </table>
+            </div>
+        </div>
+
         <div class="modal" id="agentModal">
             <div class="modal-content">
                 <div class="modal-header">
@@ -285,9 +323,12 @@ function switchTab(tab, updateHash = true) {
     document.getElementById('task-lists-tab').style.display = tab === 'task-lists' ? '' : 'none';
     const fbTab = document.getElementById('feedback-tab');
     if (fbTab) fbTab.style.display = tab === 'feedback' ? '' : 'none';
+    const aiTab = document.getElementById('ai-sessions-tab');
+    if (aiTab) aiTab.style.display = tab === 'ai-sessions' ? '' : 'none';
     if (tab === 'agents' && agentTasks.length === 0) loadAgents();
     if (tab === 'task-lists') loadTaskLists();
     if (tab === 'feedback') loadFeedback();
+    if (tab === 'ai-sessions') loadAiSessions();
     if (updateHash) window.location.hash = tab === 'tickets' ? '' : tab;
 }
 
@@ -842,7 +883,7 @@ function agentSortBy(col) {
 
 renderApp();
 
-const VALID_TABS = ['tickets', 'agents', 'task-lists', 'feedback'];
+const VALID_TABS = ['tickets', 'agents', 'task-lists', 'feedback', 'ai-sessions'];
 const initialTab = window.location.hash.replace('#', '') || 'tickets';
 if (VALID_TABS.includes(initialTab)) switchTab(initialTab, false);
 window.addEventListener('hashchange', () => {
@@ -859,7 +900,150 @@ setInterval(() => {
     else if (currentTab === 'agents') loadAgents();
     else if (currentTab === 'feedback') loadFeedback();
     else if (currentTab === 'task-lists') loadTaskLists();
+    else if (currentTab === 'ai-sessions') loadAiSessions();
 }, 30 * 1000);
+
+// ─── AI Sessions ────────────────────────────────────────────────
+
+let aiSessions = [];
+let aiSessionsSummary = { live: 0, orphans: 0, tokens_24h: 0, users: 0 };
+let aiSessionsCollectedAt = null;
+let aiSessionsFilter = 'all';
+
+async function loadAiSessions() {
+    try {
+        const resp = await fetch(AI_SESSIONS_API + '?t=' + Date.now());
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        aiSessions = data.sessions || [];
+        aiSessionsSummary = data.summary || { live: 0, orphans: 0, tokens_24h: 0, users: 0 };
+        aiSessionsCollectedAt = data.collected_at || null;
+        renderAiSessionsStats();
+        renderAiSessions();
+        const el = document.getElementById('aiSessionsLastSynced');
+        if (el) el.textContent = 'Last synced: ' + (aiSessionsCollectedAt ? formatTime(aiSessionsCollectedAt) : 'unknown');
+    } catch (e) {
+        const b = document.getElementById('aiSessionsBody');
+        if (b) b.innerHTML = '<tr><td colspan="8" class="empty">Failed to load AI sessions: ' + esc(e.message || String(e)) + '</td></tr>';
+    }
+}
+
+function renderAiSessionsStats() {
+    const s = aiSessionsSummary;
+    const dormant = aiSessions.filter(x => x.activity === 'dormant').length;
+    const looping = aiSessions.filter(x => x.activity === 'looping').length;
+    document.getElementById('aiSessionsStats').innerHTML = `
+        <div class="stat"><div class="stat-value" style="color:#58a6ff">${s.live || 0}</div><div class="stat-label">Live sessions</div></div>
+        <div class="stat"><div class="stat-value" style="color:${dormant > 0 ? '#d29922' : '#8b949e'}">${dormant}</div><div class="stat-label">Dormant (6h+)</div></div>
+        <div class="stat"><div class="stat-value" style="color:${looping > 0 ? '#f85149' : '#8b949e'}">${looping}</div><div class="stat-label">Looping (8h+)</div></div>
+        <div class="stat"><div class="stat-value" style="color:${(s.orphans || 0) > 0 ? '#f85149' : '#8b949e'}">${s.orphans || 0}</div><div class="stat-label">Orphans</div></div>
+        <div class="stat"><div class="stat-value" style="color:#bc8cff">${formatTokens(s.tokens_24h || 0)}</div><div class="stat-label">Tokens (24h)</div></div>
+        <div class="stat"><div class="stat-value">${s.users || 0}</div><div class="stat-label">Users reporting</div></div>
+    `;
+}
+
+function setAiSessionsFilter(f) {
+    aiSessionsFilter = f;
+    document.querySelectorAll('#ai-sessions-tab .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.aiFilter === f));
+    renderAiSessions();
+}
+
+// Humanise a duration in seconds like "1d 2h", "23m", "45s".
+function formatRuntime(sec) {
+    if (sec == null || sec < 0) return '-';
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (d > 0) return d + 'd ' + h + 'h';
+    if (h > 0) return h + 'h ' + m + 'm';
+    if (m > 0) return m + 'm';
+    return s + 's';
+}
+
+// Compact token count like "102k", "15.0m".
+function formatTokensCompact(v) {
+    if (v == null) return '0';
+    if (v >= 1000000) return (v / 1000000).toFixed(1) + 'm';
+    if (v >= 1000) return Math.round(v / 1000) + 'k';
+    return String(v);
+}
+
+function getFilteredAiSessions() {
+    const search = (document.getElementById('aiSessionsSearch')?.value || '').toLowerCase();
+    return aiSessions.filter(s => {
+        if (aiSessionsFilter === 'live' && s.status !== 'live') return false;
+        if (aiSessionsFilter === 'orphan' && !s.orphan) return false;
+        if (aiSessionsFilter === 'ended' && s.status !== 'ended') return false;
+        if (aiSessionsFilter === 'active' && s.activity !== 'active') return false;
+        if (aiSessionsFilter === 'dormant' && s.activity !== 'dormant') return false;
+        if (aiSessionsFilter === 'looping' && s.activity !== 'looping') return false;
+        if (search) {
+            const hay = `${s.user} ${s.pid} ${s.model} ${s.session_id} ${s.cwd} ${s.attached_label || ''}`.toLowerCase();
+            if (!hay.includes(search)) return false;
+        }
+        return true;
+    });
+}
+
+// Activity badge colours: active=green, idle=grey, dormant=amber, looping=red.
+const AI_ACTIVITY_STYLE = {
+    active:  { color: '#3fb950', label: 'active' },
+    idle:    { color: '#8b949e', label: 'idle' },
+    dormant: { color: '#d29922', label: 'dormant' },
+    looping: { color: '#f85149', label: 'looping' },
+    ended:   { color: '#6e7681', label: 'ended' },
+    unknown: { color: '#6e7681', label: '—' },
+};
+
+function aiActivityCell(s) {
+    const a = AI_ACTIVITY_STYLE[s.activity] || AI_ACTIVITY_STYLE.unknown;
+    const age = (s.last_active_age_seconds != null)
+        ? 'last activity ' + formatRuntime(s.last_active_age_seconds) + ' ago' : '';
+    return `<span class="ai-badge" style="background:${a.color}22;color:${a.color};border:1px solid ${a.color}55" title="${esc(age)}">${a.label}</span>`;
+}
+
+function aiAttachedCell(s) {
+    if (!s.attached_label) return '<span style="color:#6e7681">—</span>';
+    const stateColor = s.attached_state === 'attached' ? '#3fb950'
+        : (s.attached_state === 'panel' ? '#bc8cff' : '#8b949e');
+    const proj = s.project ? ` · <span style="color:#6e7681">${esc(s.project)}</span>` : '';
+    const state = s.attached_state ? ` <span style="color:${stateColor};font-size:0.85em">(${esc(s.attached_state)})</span>` : '';
+    return `<span>${esc(s.attached_label)}${state}${proj}</span>`;
+}
+
+function renderAiSessions() {
+    const body = document.getElementById('aiSessionsBody');
+    if (!body) return;
+    const rows = getFilteredAiSessions();
+    if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="8" class="empty">No AI sessions found</td></tr>';
+        return;
+    }
+    body.innerHTML = rows.map(s => {
+        const tok = s.tokens || {};
+        const tokenCell = formatTokensCompact(tok.output || 0) + ' / ' + formatTokensCompact(tok.cache_read || 0);
+        let statusCell, rowClass = '';
+        if (s.orphan) {
+            rowClass = ' class="ai-orphan-row"';
+            statusCell = '<span class="ai-badge ai-badge-orphan">ORPHAN — no open tab</span>';
+        } else if (s.status === 'live') {
+            statusCell = '<span class="ai-badge ai-badge-live">live</span>';
+        } else {
+            statusCell = '<span class="ai-badge ai-badge-ended">ended</span>';
+        }
+        return `<tr${rowClass}>
+            <td class="user">${esc(s.user || '-')}</td>
+            <td class="num">${s.pid != null ? esc(String(s.pid)) : '-'}</td>
+            <td class="model">${esc(s.model || '-')}</td>
+            <td class="timestamp">${s.status === 'live' ? formatRuntime(s.runtime_seconds) : '-'}</td>
+            <td class="num" title="in ${formatTokensCompact(tok.input || 0)} · out ${formatTokensCompact(tok.output || 0)} · cache-read ${formatTokensCompact(tok.cache_read || 0)} · cache-write ${formatTokensCompact(tok.cache_write || 0)}">${tokenCell}</td>
+            <td>${aiActivityCell(s)}</td>
+            <td class="ai-attached">${aiAttachedCell(s)}</td>
+            <td>${statusCell}</td>
+        </tr>`;
+    }).join('');
+}
 
 // ─── FreshService connection health ─────────────────────────────
 
