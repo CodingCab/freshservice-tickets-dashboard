@@ -149,4 +149,30 @@ test.describe('FreshService Tickets Dashboard', () => {
         expect(firstTicket.internal).toHaveProperty('next_action');
         expect(firstTicket.internal).toHaveProperty('summary');
     });
+
+    test('AI Sessions tab renders and endpoint returns valid JSON', async ({ page }) => {
+        const errors = [];
+        page.on('pageerror', (e) => errors.push(e.message));
+        await page.goto(BASE_URL);
+
+        // Tab button exists and switches without JS errors.
+        const tabBtn = page.locator('.page-tab[data-page="ai-sessions"]');
+        await expect(tabBtn).toBeVisible();
+        await tabBtn.click();
+        await expect(page.locator('#ai-sessions-tab')).toBeVisible();
+        await expect(page.locator('#ai-sessions-tab h1')).toHaveText('AI Sessions');
+        await expect(page.locator('#aiSessionsStats .stat')).not.toHaveCount(0);
+        expect(errors).toEqual([]);
+
+        // Endpoint returns the documented structure.
+        const response = await page.request.get(BASE_URL + 'api/ai-sessions');
+        expect(response.ok()).toBeTruthy();
+        const data = await response.json();
+        expect(data).toHaveProperty('sessions');
+        expect(data).toHaveProperty('summary');
+        expect(data.summary).toHaveProperty('live');
+        expect(data.summary).toHaveProperty('orphans');
+        expect(data.summary).toHaveProperty('tokens_24h');
+        expect(Array.isArray(data.sessions)).toBeTruthy();
+    });
 });

@@ -426,7 +426,7 @@ class TicketActionController extends Controller
 
         // 2. Validate the request body.
         $validator = Validator::make($request->all(), [
-            'feedback' => 'required|string|min:5|max:500',
+            'feedback' => 'required|string|min:5|max:2000',
         ]);
         if ($validator->fails()) {
             return response()->json([

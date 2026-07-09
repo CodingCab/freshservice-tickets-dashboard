@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Services\ReplyHtmlBuilder;
 use App\Services\TicketFile;
 use App\Services\TicketHtmlEnricher;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\Process\Process;
 
@@ -202,51 +203,139 @@ class TicketsController extends Controller
     /**
      * Agent queue API — returns all agent tasks from the queue folders.
      */
-    public function agents()
+    public function agents(Request $request)
     {
         $queueDir = '/shared/agents/queue';
-        $dirs = [
-            'pending'   => $queueDir . '/pending',
-            'running'   => $queueDir . '/running',
-            'completed' => $queueDir . '/completed',
-            'failed'    => $queueDir . '/failed',
-            'cancelled' => $queueDir . '/cancelled',
-        ];
+        // Optional ISO-8601 UTC bounds. No params = full history, no caps —
+        // how much is visible is the caller's choice, not the server's.
+        $since = $request->query('since');
+        $until = $request->query('until');
+
+        $timeOf = fn($t) => $t['created_at'] ?? $t['failed_at'] ?? $t['started_at'] ?? '';
 
         $tasks = [];
-
-        foreach ($dirs as $status => $dir) {
-            if (!is_dir($dir)) continue;
-            $files = glob($dir . '/*.json');
-
-            // Filter out unreadable files first
-            $files = array_filter($files, 'is_readable');
-
-            // For completed/cancelled, sort by mtime desc and limit
-            if ($status === 'completed' || $status === 'cancelled') {
-                usort($files, fn($a, $b) => @filemtime($b) - @filemtime($a));
-                $files = array_slice($files, 0, 50);
-            }
-
-            foreach ($files as $file) {
+        $readDir = function (string $dir, ?string $status) use (&$tasks) {
+            if (!is_dir($dir)) return;
+            foreach (glob($dir . '/*.json') as $file) {
                 if (!is_readable($file)) continue;
                 $task = @json_decode(file_get_contents($file), true);
                 if (!$task) continue;
-                $task['status'] = $status;
+                if ($status !== null) {
+                    $task['status'] = $status;
+                } else {
+                    // Archived entry: the folder no longer says what it was.
+                    // New archives carry a stamped terminal status; legacy ones
+                    // are inferred from which terminal timestamp they have.
+                    if (!empty($task['failed_at'])) $task['status'] = 'failed';
+                    elseif (!empty($task['completed_at'])) $task['status'] = 'completed';
+                    elseif (!in_array($task['status'] ?? '', ['completed', 'failed', 'cancelled'], true)) $task['status'] = 'completed';
+                }
                 $tasks[] = $task;
+            }
+        };
+
+        foreach (['pending', 'running', 'completed', 'failed', 'cancelled'] as $status) {
+            $readDir($queueDir . '/' . $status, $status);
+        }
+
+        // Pull in archive months that overlap the requested range (all of them
+        // when unbounded). ISO timestamps compare correctly as strings; the
+        // "-31" upper bound is safe for short months since it's lexical, not a
+        // real date.
+        foreach (glob($queueDir . '/archive/*', GLOB_ONLYDIR) ?: [] as $monthDir) {
+            $month = basename($monthDir);
+            if (!preg_match('/^\d{4}-\d{2}$/', $month)) continue;
+            if ($since && strcmp($month . '-31T23:59:59Z', $since) < 0) continue;
+            if ($until && strcmp($month . '-01T00:00:00Z', $until) > 0) continue;
+            $readDir($monthDir, null);
+        }
+
+        // Range applies to finished work; running/pending are "now" and always
+        // included so the live picture is never filtered away.
+        if ($since || $until) {
+            $tasks = array_values(array_filter($tasks, function ($t) use ($since, $until, $timeOf) {
+                if (in_array($t['status'], ['running', 'pending'], true)) return true;
+                $ts = $timeOf($t);
+                if ($since && strcmp($ts, $since) < 0) return false;
+                if ($until && strcmp($ts, $until) > 0) return false;
+                return true;
+            }));
+        }
+
+        // One flat list, newest first — no status grouping.
+        usort($tasks, fn($a, $b) => strcmp($timeOf($b), $timeOf($a)));
+
+        return response()->json(['tasks' => $tasks]);
+    }
+
+    /**
+     * AI Sessions — merge the per-user Claude Code session snapshots written by
+     * bin/collect-ai-sessions.py (each user must collect their own because
+     * ~/.claude is mode 0700). Returns the flattened session list plus summary
+     * counters. Read-only; scope is live sessions + anything active in the last
+     * 24h. See bin/collect-ai-sessions.py for the field contract.
+     */
+    public function aiSessions()
+    {
+        $dir = storage_path('ai-sessions');
+        $sessions = [];
+        $collectedAt = null;
+
+        foreach (glob($dir . '/*.json') ?: [] as $file) {
+            if (!is_readable($file)) continue;
+            $data = @json_decode(file_get_contents($file), true);
+            if (!is_array($data) || !isset($data['sessions']) || !is_array($data['sessions'])) continue;
+            $user = $data['user'] ?? pathinfo($file, PATHINFO_FILENAME);
+            $userCollected = $data['collected_at'] ?? null;
+            if ($userCollected && (!$collectedAt || strcmp($userCollected, $collectedAt) > 0)) {
+                $collectedAt = $userCollected;
+            }
+            foreach ($data['sessions'] as $s) {
+                if (!is_array($s)) continue;
+                $s['user'] = $user;
+                $s['user_collected_at'] = $userCollected;
+                $sessions[] = $s;
             }
         }
 
-        // Sort: running first, pending, failed, completed; within same status by created_at desc
-        $order = ['running' => 0, 'pending' => 1, 'failed' => 2, 'cancelled' => 3, 'completed' => 4];
-        usort($tasks, function ($a, $b) use ($order) {
-            $aO = $order[$a['status']] ?? 4;
-            $bO = $order[$b['status']] ?? 4;
-            if ($aO !== $bO) return $aO - $bO;
-            return strcmp($b['created_at'] ?? '', $a['created_at'] ?? '');
+        // Summary counters.
+        $liveCount = 0;
+        $orphanCount = 0;
+        $tokens24h = 0;
+        foreach ($sessions as $s) {
+            if (($s['status'] ?? '') === 'live') {
+                $liveCount++;
+                if (!empty($s['orphan'])) $orphanCount++;
+            }
+            $t = $s['tokens'] ?? [];
+            $tokens24h += ($t['input'] ?? 0) + ($t['output'] ?? 0)
+                + ($t['cache_read'] ?? 0) + ($t['cache_write'] ?? 0);
+        }
+
+        // Orphans first, then live, then by runtime desc, ended last.
+        usort($sessions, function ($a, $b) {
+            $rank = function ($s) {
+                if (($s['status'] ?? '') === 'live') {
+                    return !empty($s['orphan']) ? 0 : 1;
+                }
+                return 2;
+            };
+            $ra = $rank($a);
+            $rb = $rank($b);
+            if ($ra !== $rb) return $ra - $rb;
+            return (int)($b['runtime_seconds'] ?? 0) - (int)($a['runtime_seconds'] ?? 0);
         });
 
-        return response()->json(['tasks' => $tasks]);
+        return response()->json([
+            'sessions'     => $sessions,
+            'collected_at' => $collectedAt,
+            'summary'      => [
+                'live'        => $liveCount,
+                'orphans'     => $orphanCount,
+                'tokens_24h'  => $tokens24h,
+                'users'       => count(glob($dir . '/*.json') ?: []),
+            ],
+        ]);
     }
 
     /**

@@ -263,11 +263,22 @@ class FreshServiceClient
         return $decoded;
     }
 
+    // Stable, pw-free creds file shared by every worker account. Same source
+    // the Python helper reads. Used as the fallback when Laravel's env() yields
+    // nothing — which happens whenever config is cached (`php artisan
+    // config:cache` makes env() return null outside config files) or the keys
+    // were never added to .env. This makes credential resolution immune to both.
+    private const SECRETS_FILE = '/shared/secrets/freshservice.env';
+
     /**
-     * Build the env array passed to the Python helper. The helper reads
-     * FRESHSERVICE_DOMAIN / FRESHSERVICE_API_KEY before falling back to its
-     * own (interactive, getpass-based) password manager. Under php-fpm there
-     * is no TTY, so the fallback path EOFs — we MUST supply both vars.
+     * Build the env array passed to the Python helper. The helper requires
+     * FRESHSERVICE_DOMAIN / FRESHSERVICE_API_KEY in its environment (under
+     * php-fpm there is no TTY, so its own interactive password-manager fallback
+     * EOFs — we MUST supply both vars).
+     *
+     * Resolution order, robust against config caching and .env gaps:
+     *   1. Laravel env() (works when config is NOT cached and .env has them).
+     *   2. The stable, pw-free secrets file at /shared/secrets/freshservice.env.
      *
      * @return array<string, string>
      */
@@ -277,9 +288,16 @@ class FreshServiceClient
         $apiKey = (string) env('FRESHSERVICE_API_KEY', '');
 
         if ($domain === '' || $apiKey === '') {
+            [$fileDomain, $fileApiKey] = $this->credsFromSecretsFile();
+            $domain = $domain !== '' ? $domain : $fileDomain;
+            $apiKey = $apiKey !== '' ? $apiKey : $fileApiKey;
+        }
+
+        if ($domain === '' || $apiKey === '') {
             throw new RuntimeException(
-                'FreshService credentials missing: set FRESHSERVICE_DOMAIN and '
-                . 'FRESHSERVICE_API_KEY in the dashboard .env file.'
+                'FreshService credentials missing: add FRESHSERVICE_DOMAIN and '
+                . 'FRESHSERVICE_API_KEY to the dashboard .env file (then '
+                . '`php artisan config:clear`), or to ' . self::SECRETS_FILE . '.'
             );
         }
 
@@ -287,5 +305,36 @@ class FreshServiceClient
             'FRESHSERVICE_DOMAIN'  => $domain,
             'FRESHSERVICE_API_KEY' => $apiKey,
         ];
+    }
+
+    /**
+     * Parse FRESHSERVICE_DOMAIN / FRESHSERVICE_API_KEY from the stable secrets
+     * file. Returns ['', ''] if the file is absent/unreadable/incomplete.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private function credsFromSecretsFile(): array
+    {
+        $domain = '';
+        $apiKey = '';
+        if (!is_readable(self::SECRETS_FILE)) {
+            return [$domain, $apiKey];
+        }
+        foreach (file(self::SECRETS_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+            $line = trim($line);
+            if ($line === '' || $line[0] === '#' || !str_contains($line, '=')) {
+                continue;
+            }
+            [$k, $v] = explode('=', $line, 2);
+            $k = trim($k);
+            $v = trim($v);
+            if ($k === 'FRESHSERVICE_DOMAIN') {
+                $domain = $v;
+            } elseif ($k === 'FRESHSERVICE_API_KEY') {
+                $apiKey = $v;
+            }
+        }
+
+        return [$domain, $apiKey];
     }
 }
