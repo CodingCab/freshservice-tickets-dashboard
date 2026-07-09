@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Services\ReplyHtmlBuilder;
 use App\Services\TicketFile;
 use App\Services\TicketHtmlEnricher;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\Process\Process;
 
@@ -202,44 +203,66 @@ class TicketsController extends Controller
     /**
      * Agent queue API — returns all agent tasks from the queue folders.
      */
-    public function agents()
+    public function agents(Request $request)
     {
         $queueDir = '/shared/agents/queue';
-        $dirs = [
-            'pending'   => $queueDir . '/pending',
-            'running'   => $queueDir . '/running',
-            'completed' => $queueDir . '/completed',
-            'failed'    => $queueDir . '/failed',
-            'cancelled' => $queueDir . '/cancelled',
-        ];
+        // Optional ISO-8601 UTC bounds. No params = full history, no caps —
+        // how much is visible is the caller's choice, not the server's.
+        $since = $request->query('since');
+        $until = $request->query('until');
+
+        $timeOf = fn($t) => $t['created_at'] ?? $t['failed_at'] ?? $t['started_at'] ?? '';
 
         $tasks = [];
-
-        foreach ($dirs as $status => $dir) {
-            if (!is_dir($dir)) continue;
-            $files = glob($dir . '/*.json');
-
-            // Filter out unreadable files first
-            $files = array_filter($files, 'is_readable');
-
-            // For completed/cancelled, sort by mtime desc and limit
-            if ($status === 'completed' || $status === 'cancelled') {
-                usort($files, fn($a, $b) => @filemtime($b) - @filemtime($a));
-                $files = array_slice($files, 0, 50);
-            }
-
-            foreach ($files as $file) {
+        $readDir = function (string $dir, ?string $status) use (&$tasks) {
+            if (!is_dir($dir)) return;
+            foreach (glob($dir . '/*.json') as $file) {
                 if (!is_readable($file)) continue;
                 $task = @json_decode(file_get_contents($file), true);
                 if (!$task) continue;
-                $task['status'] = $status;
+                if ($status !== null) {
+                    $task['status'] = $status;
+                } else {
+                    // Archived entry: the folder no longer says what it was.
+                    // New archives carry a stamped terminal status; legacy ones
+                    // are inferred from which terminal timestamp they have.
+                    if (!empty($task['failed_at'])) $task['status'] = 'failed';
+                    elseif (!empty($task['completed_at'])) $task['status'] = 'completed';
+                    elseif (!in_array($task['status'] ?? '', ['completed', 'failed', 'cancelled'], true)) $task['status'] = 'completed';
+                }
                 $tasks[] = $task;
             }
+        };
+
+        foreach (['pending', 'running', 'completed', 'failed', 'cancelled'] as $status) {
+            $readDir($queueDir . '/' . $status, $status);
         }
 
-        // One flat list, newest first — no status grouping. Fall back to
-        // failed_at/started_at for placeholder tasks written without created_at.
-        $timeOf = fn($t) => $t['created_at'] ?? $t['failed_at'] ?? $t['started_at'] ?? '';
+        // Pull in archive months that overlap the requested range (all of them
+        // when unbounded). ISO timestamps compare correctly as strings; the
+        // "-31" upper bound is safe for short months since it's lexical, not a
+        // real date.
+        foreach (glob($queueDir . '/archive/*', GLOB_ONLYDIR) ?: [] as $monthDir) {
+            $month = basename($monthDir);
+            if (!preg_match('/^\d{4}-\d{2}$/', $month)) continue;
+            if ($since && strcmp($month . '-31T23:59:59Z', $since) < 0) continue;
+            if ($until && strcmp($month . '-01T00:00:00Z', $until) > 0) continue;
+            $readDir($monthDir, null);
+        }
+
+        // Range applies to finished work; running/pending are "now" and always
+        // included so the live picture is never filtered away.
+        if ($since || $until) {
+            $tasks = array_values(array_filter($tasks, function ($t) use ($since, $until, $timeOf) {
+                if (in_array($t['status'], ['running', 'pending'], true)) return true;
+                $ts = $timeOf($t);
+                if ($since && strcmp($ts, $since) < 0) return false;
+                if ($until && strcmp($ts, $until) > 0) return false;
+                return true;
+            }));
+        }
+
+        // One flat list, newest first — no status grouping.
         usort($tasks, fn($a, $b) => strcmp($timeOf($b), $timeOf($a)));
 
         return response()->json(['tasks' => $tasks]);

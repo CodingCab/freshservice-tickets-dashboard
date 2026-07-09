@@ -20,6 +20,8 @@ h1 { font-size: 1.1em; margin-bottom: 8px; color: #fff; }
 .filters { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
 .filters input { background: #161b22; border: 1px solid #30363d; color: #e1e4e8; padding: 4px 10px; border-radius: 4px; font-size: 0.8em; width: 200px; }
 .filters input::placeholder { color: #484f58; }
+.filters select { background: #161b22; border: 1px solid #30363d; color: #e1e4e8; padding: 4px 10px; border-radius: 4px; font-size: 0.8em; }
+.filters input[type="date"] { width: auto; color-scheme: dark; }
 .filter-btn { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 0.75em; }
 .filter-btn:hover { background: #30363d; }
 .filter-btn.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }

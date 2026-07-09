@@ -70,6 +70,7 @@ window.isTicketStarred = isTicketStarred;
 let agentSort = 'created_at';
 let agentSortDir = -1;
 let agentFilter = 'all';
+let agentRange = '24h';  // '24h' | '7d' | '30d' | 'all' | 'custom'
 
 // ─── Agent column definitions ───────────────────────────────────
 // key: data field, label: header text, default: shown by default, sort: sortable field key
@@ -209,6 +210,20 @@ function renderApp() {
                 <button class="filter-btn" data-agent-filter="completed" onclick="setAgentFilter('completed')">Completed</button>
                 <button class="filter-btn" data-agent-filter="failed" onclick="setAgentFilter('failed')">Failed</button>
                 <button class="filter-btn" data-agent-filter="cancelled" onclick="setAgentFilter('cancelled')">Cancelled</button>
+            </div>
+            <div class="filters">
+                <button class="filter-btn active" data-agent-range="24h" onclick="setAgentRange('24h')">24h</button>
+                <button class="filter-btn" data-agent-range="7d" onclick="setAgentRange('7d')">7 days</button>
+                <button class="filter-btn" data-agent-range="30d" onclick="setAgentRange('30d')">30 days</button>
+                <button class="filter-btn" data-agent-range="all" onclick="setAgentRange('all')">All time</button>
+                <button class="filter-btn" data-agent-range="custom" onclick="setAgentRange('custom')">Custom</button>
+                <span id="agentCustomRange" style="display:none;">
+                    <input type="date" id="agentSinceDate" onchange="loadAgents()">
+                    <input type="date" id="agentUntilDate" onchange="loadAgents()">
+                </span>
+                <select id="agentUserFilter" onchange="renderAgentTable()"><option value="">All users</option></select>
+                <select id="agentModelFilter" onchange="renderAgentTable()"><option value="">All models</option></select>
+                <select id="agentSourceFilter" onchange="renderAgentTable()"><option value="">All sources</option></select>
             </div>
             <div class="table-wrap">
                 <table id="agentTable">
@@ -441,11 +456,57 @@ async function loadTickets() {
 
 // ─── Agents data fetching ───────────────────────────────────────
 
+function agentRangeParams() {
+    const now = Date.now();
+    const hours = { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 };
+    if (agentRange in hours) {
+        return '&since=' + encodeURIComponent(new Date(now - hours[agentRange] * 3600e3).toISOString());
+    }
+    if (agentRange === 'custom') {
+        let p = '';
+        const since = document.getElementById('agentSinceDate')?.value;
+        const until = document.getElementById('agentUntilDate')?.value;
+        if (since) p += '&since=' + encodeURIComponent(new Date(since + 'T00:00:00').toISOString());
+        if (until) p += '&until=' + encodeURIComponent(new Date(until + 'T23:59:59').toISOString());
+        return p;
+    }
+    return ''; // 'all' — no bounds, full history
+}
+
+function setAgentRange(range) {
+    agentRange = range;
+    document.querySelectorAll('[data-agent-range]').forEach(b =>
+        b.classList.toggle('active', b.dataset.agentRange === range));
+    const custom = document.getElementById('agentCustomRange');
+    if (custom) custom.style.display = range === 'custom' ? '' : 'none';
+    loadAgents();
+}
+
+// Rebuild the user/model/source dropdowns from the loaded tasks, keeping the
+// current selection when it still exists in the new data.
+function rebuildAgentFilterOptions() {
+    const defs = [
+        { id: 'agentUserFilter',   field: 'username', label: 'All users' },
+        { id: 'agentModelFilter',  field: 'model',    label: 'All models' },
+        { id: 'agentSourceFilter', field: 'source',   label: 'All sources' },
+    ];
+    for (const { id, field, label } of defs) {
+        const sel = document.getElementById(id);
+        if (!sel) continue;
+        const current = sel.value;
+        const values = [...new Set(agentTasks.map(t => t[field]).filter(Boolean))].sort();
+        sel.innerHTML = `<option value="">${label}</option>` +
+            values.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
+        if (values.includes(current)) sel.value = current;
+    }
+}
+
 async function loadAgents() {
     try {
-        const resp = await fetch(AGENTS_API + '?t=' + Date.now());
+        const resp = await fetch(AGENTS_API + '?t=' + Date.now() + agentRangeParams());
         const data = await resp.json();
         agentTasks = data.tasks || [];
+        rebuildAgentFilterOptions();
         renderAgentStats();
         renderAgentTable();
     } catch (e) {
@@ -654,8 +715,14 @@ function getPromptFirstLine(prompt) {
 
 function getFilteredAgents() {
     const search = (document.getElementById('agentSearch')?.value || '').toLowerCase();
+    const user = document.getElementById('agentUserFilter')?.value || '';
+    const model = document.getElementById('agentModelFilter')?.value || '';
+    const source = document.getElementById('agentSourceFilter')?.value || '';
     return agentTasks.filter(t => {
         if (agentFilter !== 'all' && t.status !== agentFilter) return false;
+        if (user && t.username !== user) return false;
+        if (model && t.model !== model) return false;
+        if (source && t.source !== source) return false;
         if (search) {
             const hay = `${t.id} ${t.name} ${t.prompt} ${t.username} ${t.model} ${t.source} ${t.error}`.toLowerCase();
             if (!hay.includes(search)) return false;
