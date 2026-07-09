@@ -696,6 +696,13 @@ function agentSortValue(t, sortKey) {
     if (sortKey === 'name') return (t.name || t.id || '').toLowerCase();
     if (sortKey === 'prompt') return getPromptFirstLine(t.prompt).toLowerCase();
     if (sortKey === 'duration_ms') return t.duration_ms || 0;
+    // Date columns must compare as numbers: a single row with a missing date
+    // would otherwise compare number-vs-string ("equal" to everything), making
+    // the comparator intransitive and silently breaking the whole sort.
+    if (sortKey === 'created_at' || sortKey === 'started_at' || sortKey === 'completed_at') {
+        const ts = new Date(t[sortKey] || t.failed_at || 0).getTime();
+        return isNaN(ts) ? 0 : ts;
+    }
     const v = t[sortKey];
     if (typeof v === 'string') return v.toLowerCase();
     return v ?? 0;

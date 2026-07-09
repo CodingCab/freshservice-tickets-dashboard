@@ -237,14 +237,10 @@ class TicketsController extends Controller
             }
         }
 
-        // Sort: running first, pending, failed, completed; within same status by created_at desc
-        $order = ['running' => 0, 'pending' => 1, 'failed' => 2, 'cancelled' => 3, 'completed' => 4];
-        usort($tasks, function ($a, $b) use ($order) {
-            $aO = $order[$a['status']] ?? 4;
-            $bO = $order[$b['status']] ?? 4;
-            if ($aO !== $bO) return $aO - $bO;
-            return strcmp($b['created_at'] ?? '', $a['created_at'] ?? '');
-        });
+        // One flat list, newest first — no status grouping. Fall back to
+        // failed_at/started_at for placeholder tasks written without created_at.
+        $timeOf = fn($t) => $t['created_at'] ?? $t['failed_at'] ?? $t['started_at'] ?? '';
+        usort($tasks, fn($a, $b) => strcmp($timeOf($b), $timeOf($a)));
 
         return response()->json(['tasks' => $tasks]);
     }
