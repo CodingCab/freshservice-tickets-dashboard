@@ -1,5 +1,5 @@
 <template>
-    <div v-if="isOpen" class="td-overlay" @click.self="close">
+    <div v-if="isOpen" class="td-overlay">
         <aside class="td-panel" role="dialog" aria-label="Ticket detail">
             <header class="td-header">
                 <div class="td-header-title">
@@ -17,7 +17,18 @@
                 <button class="td-close" type="button" aria-label="Close" @click="close">&times;</button>
             </header>
 
-            <ticket-actions :data="data" @action="onAction" />
+            <!-- Labels + actions belong to a ticket we actually have. While the
+                 ticket is still loading or being ingested from FreshService there
+                 is nothing to label and nothing to act on, so both stay hidden
+                 rather than offering controls over a ticket that isn't there. -->
+            <div v-if="data" class="td-labels">
+                <span class="td-labels-caption">Labels:</span>
+                <span v-for="l in ticketLabels" :key="l.id" class="label-chip" :style="{ '--lc': l.color }">{{ l.name }}</span>
+                <span v-if="!ticketLabels.length" class="td-labels-none">none</span>
+                <button type="button" class="td-labels-add" title="Assign labels" @click="openLabels">+ Labels</button>
+            </div>
+
+            <ticket-actions v-if="data" :data="data" @action="onAction" />
 
             <div v-if="agentRequestBanner" class="agent-request-banner" :class="'agent-request-banner--' + agentRequestBanner.tone">
                 <div class="agent-request-banner__head">
@@ -45,7 +56,18 @@
                 :is-open="sendModalOpen"
                 @close="sendModalOpen = false"
                 @sent="onReplySent"
+                @armed="onAutoSendArmed"
                 @reject-requested="onRejectRequested"
+            />
+
+            <split-ticket-modal
+                :ticket-id="ticketId"
+                :is-open="splitModalOpen"
+                :requester-display="(data && data.metadata && data.metadata.Requester) || ''"
+                :cc-display="(data && data.metadata && data.metadata.CC) || ''"
+                :available-attachments="allConversationAttachments"
+                @close="splitModalOpen = false"
+                @split="onSplit"
             />
 
             <confirm-modal
@@ -78,14 +100,21 @@
                 @close="subtaskModalOpen = false"
             />
 
+            <subtask-viewer-modal
+                label="Task"
+                :url="relatedModalUrl"
+                :filename="relatedModalPath"
+                :title="relatedModalTitle"
+                :is-open="relatedModalOpen"
+                @close="relatedModalOpen = false"
+            />
+
             <confirm-modal
                 :is-open="statusModalOpen"
                 :title="statusModalTitle"
                 :message="statusModalMessage"
                 :confirm-label="statusModalConfirmLabel"
                 :confirm-variant="statusModalConfirmVariant"
-                :require-reason="true"
-                :reason-required="true"
                 :busy="statusBusy"
                 @close="statusModalOpen = false"
                 @confirm="onStatusConfirm"
@@ -170,7 +199,7 @@
                     <!-- Operator note — single editable internal note, no history. -->
                     <section class="td-section td-opnote">
                         <div class="td-opnote-head">
-                            <span class="td-opnote-label">📝 Internal note</span>
+                            <span class="td-opnote-label">Internal note</span>
                             <span v-if="operatorNoteStatus" class="td-opnote-status">{{ operatorNoteStatus }}</span>
                             <button
                                 type="button"
@@ -180,11 +209,34 @@
                             >{{ operatorNoteSaving ? 'Saving…' : 'Save' }}</button>
                         </div>
                         <textarea
+                            ref="opNoteRef"
                             class="td-opnote-text"
                             v-model="operatorNote"
                             placeholder="Internal note for this ticket — only you see it. Click Save to store."
-                            rows="3"
-                            @input="operatorNoteDirty = true"
+                            rows="2"
+                            @input="operatorNoteDirty = true; autosizeOperatorNote()"
+                        ></textarea>
+                    </section>
+
+                    <!-- Internal note to FreshService — append-only. Posts a
+                         private note to the FS ticket AND shows in the
+                         conversation stream below (via sync). -->
+                    <section class="td-section td-fsnote">
+                        <div class="td-fsnote-head">
+                            <span class="td-fsnote-label">Add internal note to FreshService</span>
+                            <span v-if="fsNoteStatus" class="td-fsnote-status">{{ fsNoteStatus }}</span>
+                            <button
+                                type="button"
+                                class="td-fsnote-add"
+                                :disabled="!fsNote.trim() || fsNoteSaving"
+                                @click="addFsNote"
+                            >{{ fsNoteSaving ? 'Adding…' : 'Add note' }}</button>
+                        </div>
+                        <textarea
+                            class="td-fsnote-text"
+                            v-model="fsNote"
+                            placeholder="Private note — added to the ticket in FreshService and shown here in the conversation. The customer never sees it."
+                            rows="2"
                         ></textarea>
                     </section>
 
@@ -195,7 +247,7 @@
                         <dl class="td-meta td-meta-primary">
                             <template v-for="m in metaPrimary" :key="m.key">
                                 <dt>{{ m.key }}</dt>
-                                <dd>
+                                <dd :title="m.utc || null">
                                     <a v-if="m.key === 'Ticket URL' && m.value" :href="m.value" target="_blank" rel="noopener">{{ m.value }}</a>
                                     <template v-else>{{ m.value }}</template>
                                 </dd>
@@ -224,7 +276,7 @@
                             <dl v-if="techMetaOpen" class="td-meta td-meta-tech">
                                 <template v-for="m in metaTechnical" :key="m.key">
                                     <dt>{{ m.key }}</dt>
-                                    <dd>{{ m.value }}</dd>
+                                    <dd :title="m.utc || null">{{ m.value }}</dd>
                                 </template>
                             </dl>
                         </div>
@@ -246,7 +298,7 @@
                                     :key="i"
                                     class="td-timeline-row"
                                 >
-                                    <span v-if="line.date" class="td-timeline-date">{{ line.date }}</span>
+                                    <span v-if="line.date" class="td-timeline-date" :title="line.utc || null">{{ line.date }}</span>
                                     <span class="td-timeline-action">{{ line.action }}</span>
                                 </div>
                             </div>
@@ -256,19 +308,30 @@
                     <!-- Reply draft button — hidden when draft is stale (auto-retry in progress
                          or rejected); the next clean draft will reappear here once it lands. -->
                     <section v-if="data.reply_draft && !draftIsStale" class="td-section">
-                        <button
-                            type="button"
-                            class="btn td-draft-btn"
-                            :class="draftAlreadySent ? 'btn-sent' : 'btn-primary'"
-                            @click="sendModalOpen = true"
-                        >
-                            <template v-if="draftAlreadySent">✅ Reply sent — view</template>
-                            <template v-else>📝 View reply draft</template>
-                        </button>
-                        <div v-if="draftAlreadySent" class="td-draft-meta">
-                            Sent {{ draftSentAt }}<template v-if="data.reply_draft.conversation_id"> &middot; FS conversation #{{ data.reply_draft.conversation_id }}</template>
+                        <div class="td-draft-row">
+                            <button
+                                type="button"
+                                class="btn td-draft-btn"
+                                :class="draftAlreadySent ? 'btn-sent' : 'btn-primary'"
+                                @click="sendModalOpen = true"
+                            >
+                                <template v-if="draftAlreadySent">✅ Reply sent — view</template>
+                                <template v-else>📝 View reply draft</template>
+                            </button>
+            <!-- Passive indicator: auto-send was armed from the send modal.
+                 Arming / cancelling happens inside that modal. -->
+                            <span
+                                v-if="!draftAlreadySent && data.reply_draft.auto_send_armed"
+                                class="td-auto-send-badge"
+                                title="This reply will send automatically once it passes Security Check. Open the reply draft to cancel."
+                            >
+                                <span class="td-auto-send-icon">⚡</span> Auto-send armed
+                            </span>
                         </div>
-                        <div v-else-if="draftCreatedAt" class="td-draft-meta">Created: {{ draftCreatedAt }}</div>
+                        <div v-if="draftAlreadySent" class="td-draft-meta">
+                            Sent <span :title="toUtcLabel(data.reply_draft.sent_at) || null">{{ draftSentAt }}</span><template v-if="data.reply_draft.conversation_id"> &middot; FS conversation #{{ data.reply_draft.conversation_id }}</template>
+                        </div>
+                        <div v-else-if="draftCreatedAt" class="td-draft-meta" :title="toUtcLabel(data.reply_draft.created_at) || null">Created: {{ draftCreatedAt }}</div>
                     </section>
 
                     <!-- Stale-draft notice — surfaces the state so the reviewer understands
@@ -299,10 +362,11 @@
                         <div v-if="data.body || data.body_html" class="td-initial-label">Description</div>
                         <div
                             v-if="data.body || data.body_html"
+                            ref="initialBodyRef"
                             class="td-initial-body-wrap"
-                            :class="{ 'td-initial-collapsed': !initialMessageExpanded }"
+                            :class="{ 'td-initial-collapsed': initialCollapsible && !initialMessageExpanded }"
                         >
-                            <div v-if="data.body_html" class="td-body-text td-html" v-html="data.body_html"></div>
+                            <div v-if="data.body_html" class="td-body-text td-html" v-html="withApiBase(data.body_html)"></div>
                             <div v-else class="td-body-text">
                                 <template v-for="(seg, i) in renderSegments(data.body)" :key="i">
                                     <pre v-if="seg.type === 'text'" class="td-body-para">{{ seg.value }}</pre>
@@ -339,8 +403,43 @@
                                 </template>
                             </div>
                         </div>
+                        <!-- Files the customer sent with the opening message.
+                             Rendered from the ticket's `## Attachments` list, so a
+                             real file (a PDF) is visible and downloadable — inline
+                             images already appear in the body above and are marked
+                             as such rather than offered twice as if they were new. -->
+                        <div v-if="ticketAttachments.length" class="td-tatt">
+                            <div class="td-tatt-label">
+                                Attachments ({{ ticketAttachments.length }})
+                            </div>
+                            <ul class="td-tatt-list">
+                                <li v-for="(a, i) in ticketAttachments" :key="i" class="td-tatt-item">
+                                    <a v-if="a.downloadable"
+                                       :href="attachmentUrl(a.filename)"
+                                       target="_blank" rel="noopener"
+                                       class="td-tatt-link"
+                                       :title="'Open / download ' + a.filename"
+                                    >
+                                        <span class="td-tatt-icon">{{ attachmentIcon(a.filename) }}</span>
+                                        <span class="td-tatt-name">{{ a.filename }}</span>
+                                    </a>
+                                    <span v-else class="td-tatt-link td-tatt-dead">
+                                        <span class="td-tatt-icon">⚠</span>
+                                        <span class="td-tatt-name">{{ a.filename }}</span>
+                                    </span>
+                                    <span v-if="a.inline" class="td-tatt-tag">shown in message</span>
+                                    <span v-if="a.status === 'blocked'" class="td-tatt-tag td-tatt-tag-bad">
+                                        blocked{{ a.note ? ': ' + a.note : '' }}
+                                    </span>
+                                    <span v-else-if="a.status === 'download_failed'" class="td-tatt-tag td-tatt-tag-bad">
+                                        download failed
+                                    </span>
+                                </li>
+                            </ul>
+                        </div>
+
                         <button
-                            v-if="data.body || data.body_html"
+                            v-if="(data.body || data.body_html) && initialCollapsible"
                             type="button"
                             class="td-initial-toggle"
                             @click="initialMessageExpanded = !initialMessageExpanded"
@@ -401,7 +500,8 @@
                                 <li v-for="t in data.related_tasks" :key="t.task_id + '-' + t.list" class="td-related-task">
                                     <span class="td-checkbox">{{ t.checked ? '[x]' : '[ ]' }}</span>
                                     <span class="td-related-id">{{ t.task_id }}</span>
-                                    <span class="td-related-title">{{ t.title }}</span>
+                                    <a v-if="t.task_id" href="#" @click.prevent="openRelated(t)" class="td-related-title td-related-title-link">{{ t.title }}</a>
+                                    <span v-else class="td-related-title">{{ t.title }}</span>
                                     <span class="td-badge td-related-list" :title="t.list + ' — ' + t.section">
                                         <span class="td-related-list-name">{{ t.list }}</span>
                                         <span class="td-related-list-sep"> · </span>
@@ -454,13 +554,13 @@
                                     <span v-if="r.author_email && r.author_name" class="td-reply-email">&lt;{{ r.author_email }}&gt;</span>
                                 </div>
                                 <div class="td-reply-meta-line">
-                                    <span class="td-reply-timestamp">{{ r.timestamp }}</span>
+                                    <span class="td-reply-timestamp" :title="toUtcLabel(r.timestamp) || null">{{ toLocalTime(r.timestamp) }}</span>
                                 </div>
                             </div>
                             <div class="td-reply-body">
-                                <div v-if="r.body_html" class="td-html" v-html="r.body_html"></div>
+                                <div v-if="r.body_html" class="td-html" v-html="withApiBase(r.body_html)"></div>
                                 <template v-else v-for="(seg, i) in renderSegments(r.body)" :key="i">
-                                    <p v-if="seg.type === 'text'">{{ seg.value }}</p>
+                                    <pre v-if="seg.type === 'text'" class="td-body-para">{{ seg.value }}</pre>
                                     <div v-else-if="seg.type === 'image'" class="td-reply-img-wrap">
                                         <a :href="attachmentUrl(seg.filename)" target="_blank" rel="noopener">
                                             <img :src="attachmentUrl(seg.filename)" :alt="seg.filename" class="td-inline-img" />
@@ -483,7 +583,7 @@
                                     <details v-else-if="seg.type === 'signature'" class="td-signature">
                                         <summary class="td-signature-summary">— signature —</summary>
                                         <template v-for="(sub, j) in seg.children" :key="j">
-                                            <p v-if="sub.type === 'text'">{{ sub.value }}</p>
+                                            <pre v-if="sub.type === 'text'" class="td-body-para">{{ sub.value }}</pre>
                                             <div v-else-if="sub.type === 'image'" class="td-reply-img-wrap">
                                                 <a :href="attachmentUrl(sub.filename)" target="_blank" rel="noopener">
                                                     <img :src="attachmentUrl(sub.filename)" :alt="sub.filename" class="td-inline-img" />
@@ -492,6 +592,24 @@
                                         </template>
                                     </details>
                                 </template>
+                                <!-- Files the customer/agent attached to THIS reply.
+                                     Shown regardless of the body_html vs markdown
+                                     path above, so a screenshot on a follow-up reply
+                                     is always visible (images inline, files as links). -->
+                                <div v-if="r.attachments && r.attachments.length" class="td-attach-block td-reply-attach">
+                                    <div class="td-attach-label">Attachments ({{ r.attachments.length }}):</div>
+                                    <div class="td-attach-grid">
+                                        <a v-for="(att, j) in r.attachments" :key="j"
+                                           :href="attachmentUrl(att.filename)"
+                                           target="_blank" rel="noopener"
+                                           class="td-attach-tile"
+                                           :title="'Open / download ' + att.filename"
+                                        >
+                                            <img v-if="isImage(att.filename)" :src="attachmentUrl(att.filename)" :alt="att.filename" />
+                                            <span v-else class="td-attach-file">{{ att.filename }}</span>
+                                        </a>
+                                    </div>
+                                </div>
                             </div>
                         </article>
                     </section>
@@ -513,6 +631,8 @@ import ManualReplyModal from './ManualReplyModal.vue';
 import SubtaskViewerModal from './SubtaskViewerModal.vue';
 import ConfirmModal from './ConfirmModal.vue';
 import KnowledgeFactModal from './KnowledgeFactModal.vue';
+import SplitTicketModal from './SplitTicketModal.vue';
+import modalStackMixin from '../modalStackMixin';
 
 /**
  * TicketDetail — side panel that loads and displays a parsed ticket file.
@@ -529,7 +649,8 @@ import KnowledgeFactModal from './KnowledgeFactModal.vue';
  */
 export default {
     name: 'TicketDetail',
-    components: { TicketActions, RejectFeedbackModal, ReplyDraftModal, ManualReplyModal, SubtaskViewerModal, ConfirmModal, KnowledgeFactModal },
+    mixins: [modalStackMixin],
+    components: { TicketActions, RejectFeedbackModal, ReplyDraftModal, ManualReplyModal, SubtaskViewerModal, ConfirmModal, KnowledgeFactModal, SplitTicketModal },
     props: {
         ticketId: { type: String, default: '' },
         isOpen:   { type: Boolean, default: false },
@@ -543,6 +664,7 @@ export default {
             timelineOpen: false,
             rejectModalOpen: false,
             sendModalOpen: false,
+            splitModalOpen: false,
             humanReviewModalOpen: false,
             closeModalOpen: false,
             automationFeedbackModalOpen: false,
@@ -551,11 +673,21 @@ export default {
             knowledgeFactBusy: false,
             replySortDesc: true, // default: newest reply at the top
             showInternalMessages: false, // default: HIDE everything except customer ↔ agent public replies
-            initialMessageExpanded: true, // collapsed when there are replies, expanded when there aren't (set in load())
+            // The opening message collapses only when BOTH hold:
+            //   1. it is genuinely too long to fit (measured, see
+            //      measureInitialOverflow), AND
+            //   2. there is at least one reply to read below it.
+            // With no replies the opening message IS the whole conversation —
+            // there is nothing to scroll down to, so it is always shown in
+            // full however long it is. `initialCollapsible` is that verdict;
+            // when false there is no clipping, no fade and no toggle button.
+            initialMessageExpanded: false,
+            initialCollapsible: false,
             techMetaOpen: false, // technical metadata block is collapsed by default
             subtasksOpen: false, // subtasks disclosure is collapsed by default
             relatedTasksOpen: false, // related-tasks disclosure is collapsed by default
             starTick: 0, // bump to re-evaluate isStarred when the legacy table flips state
+            labelTick: 0, // bump to re-evaluate ticketLabels when labels change elsewhere
             humanReviewBusy: false,
             closeBusy: false,
             statusModalOpen: false,
@@ -569,15 +701,43 @@ export default {
             operatorNoteDirty: false,
             operatorNoteSaving: false,
             operatorNoteStatus: '',
+            fsNote: '',
+            fsNoteSaving: false,
+            fsNoteStatus: '',
             manualReplyModalOpen: false,
             subtaskModalOpen: false,
             subtaskModalFilename: '',
             subtaskModalTitle: '',
+            relatedModalOpen: false,
+            relatedModalUrl: '',
+            relatedModalPath: '',
+            relatedModalTitle: '',
             toastMessage: '',
             toastTimer: null,
         };
     },
     computed: {
+        /** Files sent with the opening message (see `## Attachments`). */
+        ticketAttachments() {
+            return (this.data && this.data.attachments) || [];
+        },
+        // Every attachment across the whole conversation (opening message + all
+        // replies), deduped by filename — the pool the split modal lets the
+        // operator pick from to carry over to the new ticket.
+        allConversationAttachments() {
+            if (!this.data) return [];
+            const seen = {};
+            const out = [];
+            const add = (list) => {
+                for (const a of (list || [])) {
+                    const f = a && a.filename;
+                    if (f && !seen[f]) { seen[f] = true; out.push({ filename: f }); }
+                }
+            };
+            add(this.data.attachments);
+            for (const r of (this.data.replies || [])) add(r.attachments);
+            return out;
+        },
         automationFeedbackMessage() {
             return 'What should the automation have done differently? Refer to this ticket directly — triage reads the full context. The instruction change applies to every similar case going forward, not just this one. Goes through approval before anything is applied.';
         },
@@ -668,7 +828,7 @@ export default {
             for (let i = tlLines.length - 1; i >= 0; i--) {
                 const line = tlLines[i];
                 if (line.includes('Manual Agent Request')) {
-                    lastActivity = line.replace(/^\s*-\s*/, '').trim();
+                    lastActivity = this.localiseStamps(line.replace(/^\s*-\s*/, '').trim());
                     break;
                 }
             }
@@ -755,10 +915,10 @@ export default {
                 // Strip leading `**` ... `**` wrappers so the date itself can
                 // be lifted out cleanly.
                 let m = line.match(/^\*\*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\s*UTC)?Z?)\*\*\s*[-:\s]*(.*)$/);
-                if (m) { out.push({ date: m[1].replace(/\s+/g, ' ').trim(), action: m[2].trim() }); continue; }
+                if (m) { out.push(this.timelineEntry(m[1], m[2])); continue; }
                 m = line.match(/^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\s*UTC)?Z?)\s*[-:\s]+(.*)$/);
-                if (m) { out.push({ date: m[1].replace(/\s+/g, ' ').trim(), action: m[2].trim() }); continue; }
-                out.push({ date: '', action: line });
+                if (m) { out.push(this.timelineEntry(m[1], m[2])); continue; }
+                out.push({ date: '', utc: '', action: line });
             }
             return out;
         },
@@ -769,6 +929,23 @@ export default {
             this.starTick;
             const id = String(this.ticketId || '').replace(/^T/i, '');
             return typeof window.isTicketStarred === 'function' ? window.isTicketStarred(id) : false;
+        },
+
+        // Numeric ticket id (labels key on the FreshService number, no "T").
+        numericId() {
+            return String(this.ticketId || '').replace(/^T/i, '');
+        },
+
+        // Shared labels currently assigned to this ticket. `labelTick` is read
+        // so Vue re-evaluates when the assignment changes from the popover.
+        ticketLabels() {
+            // eslint-disable-next-line no-unused-expressions
+            this.labelTick;
+            const all = typeof window.getAllLabels === 'function' ? window.getAllLabels() : [];
+            const byId = {};
+            all.forEach(l => { byId[l.id] = l; });
+            const ids = typeof window.getTicketLabelIds === 'function' ? window.getTicketLabelIds(this.numericId) : [];
+            return ids.map(id => byId[id]).filter(Boolean);
         },
 
         /* Replies sorted + filtered by user preferences.
@@ -810,7 +987,7 @@ export default {
         },
         draftSentAt() {
             const raw = this.data && this.data.reply_draft ? this.data.reply_draft.sent_at : null;
-            return raw || '';
+            return raw ? this.toLocalTime(raw) : '';
         },
         draftCreatedAt() {
             const iso = this.data && this.data.reply_draft ? this.data.reply_draft.created_at : null;
@@ -857,14 +1034,8 @@ export default {
     },
     mounted() {
         if (this.isOpen && this.ticketId) this.load();
-        // Esc key closes the detail panel. The handler is mounted globally
-        // (not on a focused element) so it works regardless of where the
-        // user clicked last; it gates on `isOpen` so it doesn't fire while
-        // the panel is hidden.
-        this._onEscKey = (e) => {
-            if (e.key === 'Escape' && this.isOpen) this.close();
-        };
-        document.addEventListener('keydown', this._onEscKey);
+        // Esc is handled centrally by window.ModalStack (via modalStackMixin) so
+        // only the frontmost modal closes — no per-panel Esc handler here.
         // The legacy table's star-toggle handler notifies us so the header
         // icon stays in sync if the user toggles from the table while the
         // panel is open.
@@ -872,10 +1043,12 @@ export default {
             const myId = String(this.ticketId || '').replace(/^T/i, '');
             if (String(id) === myId) this.starTick++;
         };
+        // Refresh label chips when the shared list / assignment changes anywhere.
+        window.onTicketLabelsChanged = () => { this.labelTick++; };
     },
     beforeUnmount() {
-        if (this._onEscKey) document.removeEventListener('keydown', this._onEscKey);
         if (window.onTicketStarChanged) window.onTicketStarChanged = null;
+        if (window.onTicketLabelsChanged) window.onTicketLabelsChanged = null;
         this.stopAgentBannerTimer();
         clearTimeout(this._ingestRetry);
     },
@@ -897,25 +1070,68 @@ export default {
         pickMeta(keys) {
             if (!this.data || !this.data.metadata) return [];
             return keys
-                .map(k => ({ key: k, value: this.formatMetaValue(k, this.data.metadata[k]) }))
+                .map(k => ({
+                    key: k,
+                    value: this.formatMetaValue(k, this.data.metadata[k]),
+                    utc: this.utcTooltip(k, this.data.metadata[k]),
+                }))
                 .filter(m => this.metaValueIsMeaningful(m.value));
         },
-        /* Pretty-print date-like metadata values so the dashboard shows
-           "2026-06-11 06:58 UTC" instead of the raw ISO 8601 the FS
-           ingest writes ("2026-06-11T06:58:03Z"). Non-date keys pass
-           through untouched. Unparseable date strings also pass through. */
+        /* Render date-like metadata in the VIEWER's own time zone, so everyone
+           reads a time that means something where they are. Non-date keys and
+           unparseable strings pass through untouched. The stored UTC value is
+           kept alongside as the hover tooltip — see `utcTooltip`. */
         formatMetaValue(key, value) {
             if (value === null || value === undefined) return value;
-            const dateKeys = new Set(['Received', 'Created Date', 'Updated', 'Resolved At', 'Closed At']);
-            if (!dateKeys.has(key)) return value;
+            if (!this.isDateKey(key)) return value;
             const s = String(value).trim();
             if (!s) return s;
-            // Already-formatted "YYYY-MM-DD HH:MM UTC" or similar — leave alone.
-            if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}( UTC)?$/i.test(s)) return s;
-            const d = new Date(s);
-            if (isNaN(d.getTime())) return s;
-            const pad = (n) => String(n).padStart(2, '0');
-            return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
+            return this.toLocalTime(s);
+        },
+        /* The stored UTC value, shown on hover so it can still be compared
+           against FreshService and the logs. Empty for non-date fields. */
+        utcTooltip(key, value) {
+            if (!this.isDateKey(key) || value === null || value === undefined) return '';
+            const s = String(value).trim();
+            return s ? this.toUtcLabel(s) : '';
+        },
+        isDateKey(key) {
+            return ['Received', 'Created Date', 'Updated', 'Resolved At', 'Closed At']
+                .includes(key);
+        },
+        /* Time-zone rendering lives in one place — public/js/local-time.js,
+           shared with the SPA shell. If that script is somehow missing, show
+           the stored value unchanged rather than a broken or, worse, silently
+           wrong time. */
+        toLocalTime(value) {
+            const L = typeof window !== 'undefined' ? window.LocalTime : null;
+            return L ? L.format(value) : value;
+        },
+        toUtcLabel(value) {
+            const L = typeof window !== 'undefined' ? window.LocalTime : null;
+            return L ? L.utc(value) : '';
+        },
+        /* Convert every UTC stamp embedded in a free-text line (a raw Timeline
+           entry shown inside a sentence) to the viewer's zone, leaving the rest
+           of the wording untouched. */
+        localiseStamps(text) {
+            if (!text) return text;
+            const L = typeof window !== 'undefined' ? window.LocalTime : null;
+            if (!L) return text;
+            return String(text).replace(
+                /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?\s*(?:UTC|Z)/gi,
+                (stamp) => L.format(stamp)
+            );
+        },
+        /* One timeline row: the stamp shown in the viewer's zone, the stored
+           UTC kept for the hover tooltip, and the action text. */
+        timelineEntry(rawDate, action) {
+            const stamp = String(rawDate).replace(/\s+/g, ' ').trim();
+            return {
+                date: this.toLocalTime(stamp),
+                utc: this.toUtcLabel(stamp),
+                action: String(action).trim(),
+            };
         },
         /* Color-coded badge for the soft-tier fields. Falls back to a neutral
            tint when the value doesn't match a known bucket. */
@@ -951,6 +1167,14 @@ export default {
                 window.toggleTicketStar(id);
             }
             this.starTick++; // force the computed to re-read
+        },
+
+        // Open the shared assign-labels popover (same one the table row uses),
+        // anchored to the panel's "+ Labels" button.
+        openLabels(event) {
+            if (typeof window.openLabelPicker === 'function') {
+                window.openLabelPicker(event, this.numericId);
+            }
         },
 
         /* --- reply sorting helpers ----------------------------------------- */
@@ -1048,13 +1272,21 @@ export default {
                 if (!this.operatorNoteDirty) {
                     const raw = (fresh && fresh.operator_note) || '';
                     this.operatorNote = raw.trim() === '_(empty)_' ? '' : raw;
+                    // Size the box to the loaded note, not just to typing.
+                    this.$nextTick(() => this.autosizeOperatorNote());
                 }
                 if (!silent) {
-                    // First / interactive load: pick the initial-message
-                    // expansion default. Background refreshes leave the
-                    // operator's current choice alone.
-                    const hasReplies = !!(fresh && fresh.replies && fresh.replies.length);
-                    this.initialMessageExpanded = !hasReplies;
+                    // First / interactive load: decide whether the opening
+                    // message needs collapsing at all. Background refreshes
+                    // leave the operator's current choice alone.
+                    //
+                    // Anything that fits is shown in full — see
+                    // measureInitialOverflow, which clips and measures itself.
+                    this.initialMessageExpanded = false;
+                    this.$nextTick(() => {
+                        this.measureInitialOverflow();
+                        this.remeasureWhenImagesLoad();
+                    });
                 }
             } catch (e) {
                 if (!silent) {
@@ -1084,6 +1316,7 @@ export default {
             }
             if (key === 'ai-compose')    { this.aiComposeModalOpen = true; return; }
             if (key === 'compose-reply') { this.manualReplyModalOpen = true; return; }
+            if (key === 'split')         { this.splitModalOpen = true; return; }
             if (key === 'report-automation') { this.automationFeedbackModalOpen = true; return; }
             if (key === 'add-knowledge-fact') { this.knowledgeFactModalOpen = true; return; }
             console.log('[TicketDetail] action:', key, 'ticket:', this.ticketId);
@@ -1199,6 +1432,37 @@ export default {
                 this.operatorNoteSaving = false;
             }
         },
+        async addFsNote() {
+            const note = (this.fsNote || '').trim();
+            if (!note) return;
+            this.fsNoteSaving = true;
+            this.fsNoteStatus = '';
+            try {
+                const resp = await fetch('/api/tickets/' + encodeURIComponent(this.ticketId) + '/internal-note', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({ note }),
+                });
+                if (!resp.ok) {
+                    let detail = '';
+                    try {
+                        const errBody = await resp.json();
+                        detail = errBody.message || errBody.error || '';
+                    } catch (_) { /* ignore */ }
+                    throw new Error(detail || ('HTTP ' + resp.status));
+                }
+                await resp.json();
+                this.fsNote = '';
+                this.fsNoteStatus = 'Added';
+                setTimeout(() => { this.fsNoteStatus = ''; }, 2500);
+                // Refresh the conversation stream so the new note shows.
+                this.load({ silent: true });
+            } catch (e) {
+                this.fsNoteStatus = 'Failed: ' + (e.message || e);
+            } finally {
+                this.fsNoteSaving = false;
+            }
+        },
         async onAiComposeConfirm({ reason }) {
             this.aiComposeBusy = true;
             try {
@@ -1232,7 +1496,7 @@ export default {
                 this.aiComposeBusy = false;
             }
         },
-        async onStatusConfirm({ reason }) {
+        async onStatusConfirm() {
             if (!this.statusModalTarget) return;
             this.statusBusy = true;
             const targetLabel = this.statusModalLabel;
@@ -1242,7 +1506,6 @@ export default {
                     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
                     body: JSON.stringify({
                         status: this.statusModalTarget,
-                        reason: reason || '',
                     }),
                 });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -1260,18 +1523,120 @@ export default {
                 this.statusBusy = false;
             }
         },
+        /**
+         * Grow the internal-note box to fit its content.
+         *
+         * It used to be a fixed 3 rows, so the common case — a one-line note
+         * like "waiting for X to be released" — sat marooned at the top of an
+         * empty box, which is what made it hard to read. Now the box is as tall
+         * as the note, and grows as you type. The user can still drag-resize.
+         */
+        /** Pick a glyph by file type so the list scans without reading names. */
+        attachmentIcon(filename) {
+            const ext = String(filename || '').split('.').pop().toLowerCase();
+            if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext)) return '🖼';
+            if (ext === 'pdf') return '📕';
+            if (['xls', 'xlsx', 'csv'].includes(ext)) return '📊';
+            if (['doc', 'docx', 'odt', 'rtf'].includes(ext)) return '📄';
+            if (['zip', 'rar', '7z', 'gz', 'tar'].includes(ext)) return '🗜';
+            if (['txt', 'log'].includes(ext)) return '📃';
+            return '📎';
+        },
+        autosizeOperatorNote() {
+            const el = this.$refs.opNoteRef;
+            if (!el) return;
+            el.style.height = 'auto';           // shrink first, so deleting text shrinks the box too
+            el.style.height = el.scrollHeight + 'px';
+        },
+        /**
+         * Decide whether the opening message should be collapsed. BOTH must
+         * hold — either one alone is not enough:
+         *
+         *   1. There is at least one reply shown below it. With no replies the
+         *      opening message is the entire conversation, so there is nothing
+         *      to reveal by hiding it — it stays open at any length. Counted
+         *      from sortedReplies (what's actually rendered), not the raw list,
+         *      which is mostly internal notes / draft proposals the Replies
+         *      section hides.
+         *   2. It is genuinely too long to fit. Measured, never guessed:
+         *      scrollHeight (full content) vs clientHeight (the clipped box).
+         *      That keeps the threshold in the CSS
+         *      (`.td-initial-collapsed { max-height }`) as the single source of
+         *      truth — no duplicated line/char count in JS to drift from it.
+         *
+         * The measurement is only meaningful while the element is clipped —
+         * unclipped, scrollHeight === clientHeight and everything looks like it
+         * fits. So we re-clip first and measure on the next tick; that also
+         * keeps a re-measure (after images load) correct even when a previous
+         * pass concluded "fits" and dropped the clipping.
+         */
+        measureInitialOverflow() {
+            if (this.initialMessageExpanded) return; // operator's choice wins
+            if (!this.sortedReplies.length) {
+                this.initialCollapsible = false;     // rule 1 — never collapses
+                return;
+            }
+            this.initialCollapsible = true;          // clip, so rule 2 is measurable
+            this.$nextTick(() => {
+                const el = this.$refs.initialBodyRef;
+                if (!el) {
+                    this.initialCollapsible = false;
+                    return;
+                }
+                // 2px tolerance: sub-pixel line-height rounding otherwise
+                // reports a 1px "overflow" on text that visually fits exactly.
+                this.initialCollapsible = el.scrollHeight > el.clientHeight + 2;
+            });
+        },
+        /**
+         * Inline images (customer screenshots) have zero height until they
+         * load, so a first measurement can wrongly conclude "it fits". Re-run
+         * once each one lands.
+         */
+        remeasureWhenImagesLoad() {
+            const el = this.$refs.initialBodyRef;
+            if (!el) return;
+            el.querySelectorAll('img').forEach((img) => {
+                if (img.complete) return;
+                img.addEventListener('load', () => {
+                    // Only meaningful while still clipped — an operator who has
+                    // already expanded it must not be collapsed out from under.
+                    if (!this.initialMessageExpanded) this.measureInitialOverflow();
+                }, { once: true });
+            });
+        },
         onReplySent(payload) {
             const cid = payload && payload.conversation_id ? payload.conversation_id : '';
             this.showToast(cid ? ('Reply sent (FS #' + cid + ')') : 'Reply sent');
             this.sendModalOpen = false;
             this.load();
         },
+        onSplit(payload) {
+            const nid = payload && payload.new_ticket_id ? payload.new_ticket_id : '';
+            this.showToast(nid ? ('Split done — new ticket #' + nid + ' created') : 'Split done');
+            // Keep the modal open on its success state so the operator can click
+            // through to the new FS ticket; reload this ticket for the new
+            // Timeline entry. The modal's own Close button dismisses it.
+            this.load({ silent: true });
+        },
+        onAutoSendArmed(payload) {
+            const armed = !!(payload && payload.armed);
+            if (this.data && this.data.reply_draft) {
+                this.data.reply_draft.auto_send_armed = armed;
+            }
+            if (armed) {
+                this.showToast('Auto-send armed — this reply will send once it passes Security Check');
+                this.sendModalOpen = false;
+            } else {
+                this.showToast('Auto-send cancelled');
+            }
+        },
         onManualReplySent(payload) {
             const cid = payload && payload.conversation_id ? payload.conversation_id : '';
             this.showToast(cid ? ('Manual reply sent (FS #' + cid + ')') : 'Manual reply sent');
             this.manualReplyModalOpen = false;
-            // Reload to pick up the Timeline entry. The reply itself will
-            // appear in `## Replies` after the next sync (every 2 min).
+            // Reload picks up both the Timeline entry and the reply itself:
+            // the send endpoint syncs it into `## Replies` before responding.
             this.load();
         },
         /**
@@ -1295,6 +1660,17 @@ export default {
             this.subtaskModalFilename = filename;
             this.subtaskModalTitle = s.title || '';
             this.subtaskModalOpen = true;
+        },
+        openRelated(t) {
+            // Related tasks live on other lists (outside this ticket's directory),
+            // so they load via the /related/{taskId} endpoint, which re-derives the
+            // vetted related-task list server-side and returns that file's content.
+            if (!t || !t.task_id) return;
+            this.relatedModalUrl = '/api/tickets/' + encodeURIComponent(this.ticketId)
+                + '/related/' + encodeURIComponent(t.task_id);
+            this.relatedModalPath = t.path || '';
+            this.relatedModalTitle = t.title || t.task_id;
+            this.relatedModalOpen = true;
         },
         extractFirstEmail(s) {
             if (!s) return '';
@@ -1323,17 +1699,12 @@ export default {
         },
         formatDraftDate(value) {
             if (!value) return '';
-            // Backend now returns either a canonical UTC string from the draft's
-            // frontmatter (e.g. "2026-05-13 11:30 UTC") or a normalised UTC
-            // fallback in the same shape. Pass through if it already has " UTC";
-            // otherwise reformat via UTC accessors (NOT local-time getters) so
-            // timestamps match what's shown in ## Replies.
-            if (typeof value === 'string' && /\bUTC\b/.test(value)) return value;
-            const d = new Date(value);
-            if (isNaN(d.getTime())) return value;
-            const pad = (n) => String(n).padStart(2, '0');
-            return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate())
-                + ' ' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ' UTC';
+            // The backend returns either a canonical UTC string from the draft's
+            // frontmatter ("2026-05-13 11:30 UTC") or a normalised UTC fallback
+            // in the same shape. Both go through the same converter as every
+            // other stamp in the panel, so a draft's time reads the same way as
+            // the reply timestamps next to it.
+            return this.toLocalTime(value);
         },
         onRejected() {
             this.showToast('Draft sent back to Reply Drafting');
@@ -1489,8 +1860,19 @@ export default {
             return head;
         },
         attachmentUrl(filename) {
-            return '/api/tickets/' + encodeURIComponent(this.ticketId)
+            const base = window.__API_BASE || '';
+            return base + '/api/tickets/' + encodeURIComponent(this.ticketId)
                 + '/attachment/' + encodeURIComponent(filename);
+        },
+        // Server-enriched HTML (description / reply bodies) carries inline
+        // `<img src="/api/tickets/.../attachment/...">`. The browser loads those
+        // directly, bypassing the fetch() base-path shim, so under a
+        // subdirectory mount (e.g. /www/tickets) they escape the app root and
+        // 404. Prefix the app base onto every /api/ src+href before rendering.
+        withApiBase(html) {
+            const base = window.__API_BASE || '';
+            if (!html || !base) return html;
+            return String(html).replace(/(src|href)="\/api\//g, '$1="' + base + '/api/');
         },
         isImage(filename) {
             return /\.(png|jpe?g|gif|webp|svg)$/i.test(filename || '');
@@ -1500,6 +1882,22 @@ export default {
 </script>
 
 <style scoped>
+.td-labels {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 16px;
+    border-bottom: 1px solid #21262d;
+}
+.td-labels-caption { font-size: 0.72em; color: #8b949e; margin-right: 2px; }
+.td-labels-none { font-size: 0.72em; color: #6e7681; font-style: italic; }
+.td-labels-add {
+    margin-left: auto;
+    background: #1f6feb; border: 1px solid #1f6feb; color: #fff;
+    padding: 3px 10px; border-radius: 6px; cursor: pointer; font-size: 0.72em;
+}
+.td-labels-add:hover { background: #388bfd; border-color: #388bfd; }
 .td-overlay {
     position: fixed;
     inset: 0;
@@ -2053,12 +2451,17 @@ export default {
     display: block;
     background: #0d1117;
 }
-/* Sanitised FS HTML for body / replies. Constrain images, preserve flow. */
+/* Sanitised FS HTML for body / replies. Constrain images, preserve flow.
+   EVERY rule targeting a descendant here MUST be wrapped in `:deep()`. This
+   block styles markup injected with `v-html`, and injected nodes never get the
+   scoped-style data attribute — so a plain `.td-html img` selector compiles to
+   one that can never match, and the rule silently does nothing. That is how a
+   customer's screenshot ended up rendering at its natural pixel width and
+   overflowing the panel: `max-width: 100%` was written but never applied. */
 .td-html { font-size: 13px; line-height: 1.5; color: #c9d1d9; word-break: break-word; }
-.td-html p { margin: 0 0 8px; }
-.td-html p:last-child { margin-bottom: 0; }
-.td-html img,
-.td-html .td-inline-html-img {
+.td-html :deep(p) { margin: 0 0 8px; }
+.td-html :deep(p:last-child) { margin-bottom: 0; }
+.td-html :deep(img) {
     max-width: 100%;
     height: auto;
     margin: 6px 0;
@@ -2067,16 +2470,16 @@ export default {
     background: #0d1117;
     display: inline-block;
 }
-.td-html a { color: #58a6ff; }
-.td-html blockquote {
+.td-html :deep(a) { color: #58a6ff; }
+.td-html :deep(blockquote) {
     margin: 6px 0;
     padding: 4px 10px;
     border-left: 3px solid #30363d;
     color: #8b949e;
 }
-.td-html ul, .td-html ol { margin: 6px 0 6px 20px; padding: 0; }
-.td-html li { margin: 2px 0; }
-.td-html pre, .td-html code {
+.td-html :deep(ul), .td-html :deep(ol) { margin: 6px 0 6px 20px; padding: 0; }
+.td-html :deep(li) { margin: 2px 0; }
+.td-html :deep(pre), .td-html :deep(code) {
     background: #0d1117;
     border: 1px solid #21262d;
     border-radius: 4px;
@@ -2084,9 +2487,9 @@ export default {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 12.5px;
 }
-.td-html pre { padding: 8px 10px; overflow-x: auto; }
-.td-html table { border-collapse: collapse; margin: 6px 0; }
-.td-html th, .td-html td { border: 1px solid #30363d; padding: 4px 8px; }
+.td-html :deep(pre) { padding: 8px 10px; overflow-x: auto; }
+.td-html :deep(table) { border-collapse: collapse; margin: 6px 0; max-width: 100%; }
+.td-html :deep(th), .td-html :deep(td) { border: 1px solid #30363d; padding: 4px 8px; }
 
 /* Collapsed signature block (inside body or reply, html or text mode). */
 .td-signature,
@@ -2315,6 +2718,12 @@ export default {
     min-width: 0;
     word-break: break-word;
 }
+.td-related-title-link {
+    color: #58a6ff;
+    text-decoration: none;
+    cursor: pointer;
+}
+.td-related-title-link:hover { text-decoration: underline; }
 .td-related-list {
     background: #2c3548;
     color: #ffffff;
@@ -2388,6 +2797,24 @@ export default {
 }
 .td-draft-btn {
     font-weight: 600;
+}
+.td-draft-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.td-auto-send-badge {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    background: #1a3a1a;
+    color: #56d364;
+    border: 1px solid #2ea04380;
+    white-space: nowrap;
+}
+.td-auto-send-icon {
+    margin-right: 2px;
 }
 .td-draft-meta {
     margin-top: 6px;
@@ -2486,9 +2913,73 @@ export default {
     background: #4a1d1d;
     color: #f85149;
 }
+/* Ticket-level attachments (the `## Attachments` list) */
+.td-tatt {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed #3d4757;
+}
+.td-tatt-label {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #ffc857;
+    margin-bottom: 6px;
+}
+.td-tatt-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.td-tatt-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.td-tatt-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 5px 10px;
+    background: #1b2436;
+    border: 1px solid #3d4757;
+    border-radius: 6px;
+    text-decoration: none;
+    color: #79c0ff;
+    font-size: 13.5px;
+    font-weight: 500;
+}
+.td-tatt-link:hover {
+    background: #22304a;
+    border-color: #58a6ff;
+}
+.td-tatt-dead {
+    color: #8b949e;
+    cursor: default;
+}
+.td-tatt-dead:hover {
+    background: #1b2436;
+    border-color: #3d4757;
+}
+.td-tatt-icon { font-size: 14px; }
+.td-tatt-name { word-break: break-all; }
+.td-tatt-tag {
+    font-size: 11px;
+    color: #8b949e;
+}
+.td-tatt-tag-bad { color: #ffa198; }
+
 .td-opnote {
-    background: #1c1a12;
-    border: 1px solid #3a2d12;
+    /* Muted amber card — the accent says "internal, only you see this". The
+       tint stays low-saturation so it frames the note without competing with
+       it for attention; the readable surface is the textarea inside. */
+    background: #1f1c11;
+    border: 1px solid #5c4818;
     border-radius: 8px;
     padding: 10px 12px;
 }
@@ -2496,12 +2987,16 @@ export default {
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-bottom: 6px;
+    margin-bottom: 2px;
 }
 .td-opnote-label {
-    font-size: 12.5px;
+    /* Deliberately small and dim: the note below is the content, this is just
+       its tag. Shrunk to a caption so it stops competing with the note. */
+    font-size: 10.5px;
     font-weight: 600;
-    color: #ffc857;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #b8912f;
 }
 .td-opnote-status {
     font-size: 12px;
@@ -2528,19 +3023,90 @@ export default {
 .td-opnote-text {
     width: 100%;
     box-sizing: border-box;
-    background: #0d1117;
-    color: #c9d1d9;
-    border: 1px solid #30363d;
+    /* This note is usually "what stage is this ticket at" — the thing you want
+       to read the instant the panel opens. So it is styled as PROMINENT TEXT,
+       not as a form field: no sunken dark input, no small print. It stays a
+       real <textarea> (click and type — no edit mode to enter), but the input
+       chrome only shows up on hover/focus, when it is actually relevant. */
+    background: transparent;
+    color: #ffe9b8;
+    border: 1px solid transparent;
     border-radius: 6px;
-    padding: 8px 10px;
-    font-size: 13px;
+    padding: 6px 8px;
+    font-size: 17px;
+    font-weight: 500;
     line-height: 1.5;
     font-family: inherit;
     resize: vertical;
-    min-height: 56px;
+    /* Height follows the content (see autosizeOperatorNote) instead of a fixed
+       3 rows, so a one-line note isn't marooned in an empty box. */
+    min-height: 32px;
+    overflow-y: hidden;
+    cursor: text;
+}
+.td-opnote-text:hover {
+    border-color: #5c4818;
+    background: #17150d;
+}
+.td-opnote-text::placeholder {
+    color: #8b7a4d;
+    font-size: 13px;
+    font-weight: 400;
 }
 .td-opnote-text:focus {
     outline: none;
     border-color: #d29922;
+    background: #0d1117;   /* editing → show the input surface */
 }
+
+/* Internal-note-to-FreshService composer. Teal accent (vs the amber local
+   scratchpad above) says "this one leaves the dashboard — it lands in FS too". */
+.td-fsnote {
+    background: #0e1a1c;
+    border: 1px solid #1c4a52;
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+.td-fsnote-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+.td-fsnote-label {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #3fb6c4;
+}
+.td-fsnote-status { font-size: 12px; color: #8b949e; }
+.td-fsnote-add {
+    margin-left: auto;
+    background: #14343a;
+    color: #a5e3ec;
+    border: 1px solid #1c4a52;
+    border-radius: 4px;
+    padding: 3px 12px;
+    font-size: 12.5px;
+    cursor: pointer;
+}
+.td-fsnote-add:hover:not(:disabled) { background: #1c4a52; border-color: #3fb6c4; }
+.td-fsnote-add:disabled { opacity: 0.5; cursor: default; }
+.td-fsnote-text {
+    width: 100%;
+    box-sizing: border-box;
+    background: #0d1117;
+    color: #c9d1d9;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+    line-height: 1.5;
+    font-family: inherit;
+    resize: vertical;
+    min-height: 44px;
+}
+.td-fsnote-text::placeholder { color: #6e7681; }
+.td-fsnote-text:focus { outline: none; border-color: #3fb6c4; }
 </style>

@@ -248,6 +248,7 @@ class TicketHtmlEnricher
             return $this->plainTextFallback($html);
         }
         $this->walkAndSanitize($doc, $root, $numericTicketId, $attMap);
+        $this->flattenLayoutTables($doc);
         $this->foldSignature($doc, $root);
 
         $out = '';
@@ -255,6 +256,137 @@ class TicketHtmlEnricher
             $out .= $doc->saveHTML($child);
         }
         return trim($out);
+    }
+
+    /**
+     * Unwrap tables that are page scaffolding rather than data.
+     *
+     * Marketing and notification emails are built the 1999 way: the whole
+     * message is a stack of nested single-cell tables used purely for width
+     * and spacing, often ten levels deep, padded out with empty spacer cells.
+     * Rendering those as real tables draws a border around every level, so the
+     * reader gets a nest of empty boxes with the actual sentence squeezed into
+     * a narrow column in the middle — unreadable.
+     *
+     * A table is scaffolding when it has no header cells and no row holds more
+     * than one non-empty cell. Those get dissolved: the cell contents move up
+     * in place and the table disappears. Genuine tables — anything with a
+     * header row or a real second column — are left exactly as they are.
+     *
+     * Runs in reverse document order so the innermost table is dissolved
+     * first and the collapse propagates outward through its parents. Every
+     * check looks at a table's OWN rows only — `getElementsByTagName` reaches
+     * into nested tables, and judging a wrapper by the contents of the real
+     * table inside it keeps exactly the scaffolding this is meant to remove.
+     */
+    private function flattenLayoutTables(DOMDocument $doc): void
+    {
+        $xpath = new DOMXPath($doc);
+        $tables = [];
+        foreach ($xpath->query('//table') ?: [] as $t) {
+            $tables[] = $t;
+        }
+
+        foreach (array_reverse($tables) as $table) {
+            if (!$table instanceof DOMElement) {
+                continue;
+            }
+
+            // Spacer cells don't count towards being a real table: an email
+            // footer laid out as one column of text plus three empty ones is
+            // still scaffolding. Nothing is mutated while deciding, so a table
+            // that turns out to be real comes through completely untouched —
+            // including its legitimately blank cells.
+            $real = false;
+            foreach ($this->ownRows($table) as $row) {
+                $filled = 0;
+                foreach ($this->ownCells($row) as $cell) {
+                    if (strtolower($cell->tagName) === 'th') {
+                        $real = true; // a header row means a real table
+                        break 2;
+                    }
+                    if (!$this->isEmptyNode($cell)) {
+                        $filled++;
+                    }
+                }
+                if ($filled > 1) {
+                    $real = true; // a genuine second column
+                    break;
+                }
+            }
+            if ($real) {
+                continue;
+            }
+
+            // Scaffolding: hoist every cell's contents into the table's place.
+            $parent = $table->parentNode;
+            if ($parent === null) {
+                continue;
+            }
+            foreach ($this->ownRows($table) as $row) {
+                foreach ($this->ownCells($row) as $cell) {
+                    while ($cell->firstChild !== null) {
+                        $parent->insertBefore($cell->firstChild, $table);
+                    }
+                }
+            }
+            $parent->removeChild($table);
+        }
+    }
+
+    /**
+     * Rows belonging to this table itself — not to a table nested inside it.
+     *
+     * @return array<int, DOMElement>
+     */
+    private function ownRows(DOMElement $table): array
+    {
+        $rows = [];
+        foreach ($table->getElementsByTagName('tr') as $row) {
+            $ancestor = $row->parentNode;
+            while ($ancestor instanceof DOMElement && strtolower($ancestor->tagName) !== 'table') {
+                $ancestor = $ancestor->parentNode;
+            }
+            if ($ancestor === $table) {
+                $rows[] = $row;
+            }
+        }
+        return $rows;
+    }
+
+    /**
+     * Direct `td` / `th` children of a row.
+     *
+     * @return array<int, DOMElement>
+     */
+    private function ownCells(DOMElement $row): array
+    {
+        $cells = [];
+        foreach ($row->childNodes as $c) {
+            if ($c instanceof DOMElement && in_array(strtolower($c->tagName), ['td', 'th'], true)) {
+                $cells[] = $c;
+            }
+        }
+        return $cells;
+    }
+
+    /**
+     * True when a node carries nothing a reader would see — no text, and no
+     * standalone visual element (image, rule, or a table still holding either).
+     */
+    private function isEmptyNode(DOMNode $node): bool
+    {
+        if (trim(preg_replace('/[\s\x{00A0}]+/u', '', $node->textContent) ?? '') !== '') {
+            return false;
+        }
+        if ($node instanceof DOMElement) {
+            foreach (['img', 'hr'] as $visual) {
+                if ($node->getElementsByTagName($visual)->length > 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -418,7 +550,11 @@ class TicketHtmlEnricher
         }
 
         $attachmentId = null;
-        if (str_contains($src, 'attachment.freshservice.com')
+        // Freshworks serves inline attachments from two CDN hosts —
+        // attachment.freshservice.com and attachment.freshdesk.com — depending
+        // on the channel the message came through. Both carry the same JWT
+        // token whose payload holds the numeric attachment id.
+        if ((str_contains($src, 'attachment.freshservice.com') || str_contains($src, 'attachment.freshdesk.com'))
             && preg_match('/[?&]token=([A-Za-z0-9._\-]+)/', $src, $m)
         ) {
             $parts = explode('.', $m[1]);

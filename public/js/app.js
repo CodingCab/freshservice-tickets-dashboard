@@ -21,6 +21,36 @@ let sortDir = 1;
 let currentTab = 'tickets';
 let showStarredOnly = false;
 
+// ─── Modal stack ──────────────────────────────────────────────────
+// Shared, cross-world (legacy + Vue) stack of open modals/panels. Every modal
+// registers itself when it opens and unregisters when it closes. A single
+// Escape handler closes ONLY the frontmost (last-opened) one, so nested
+// modals unwind one Esc-press at a time. Clicking outside never closes a modal
+// (all backdrop-close handlers are removed). The Vue components push/pop via
+// window.ModalStack too — same object, one source of truth.
+window.ModalStack = window.ModalStack || (function () {
+    const stack = []; // [{ id, close }] — order = open order; last = frontmost
+    return {
+        push(entry) {
+            if (!entry || !entry.id) return;
+            this.remove(entry.id);           // no dupes; re-open moves to top
+            stack.push(entry);
+        },
+        remove(id) {
+            const i = stack.findIndex(e => e.id === id);
+            if (i !== -1) stack.splice(i, 1);
+        },
+        pop() {
+            const top = stack.pop();
+            if (top && typeof top.close === 'function') {
+                try { top.close(); } catch (e) { /* ignore */ }
+            }
+            return !!top;
+        },
+        get size() { return stack.length; },
+    };
+})();
+
 // ─── Starred tickets (persisted in localStorage) ──────────────────
 // Operators star tickets they want quick access to. The "★ Starred only"
 // filter button at the top of the tickets table toggles a view that hides
@@ -61,11 +91,656 @@ function toggleStarredOnlyFilter() {
     showStarredOnly = !showStarredOnly;
     const btn = document.getElementById('starredOnlyBtn');
     if (btn) btn.classList.toggle('active', showStarredOnly);
+    saveUiPrefs();
     renderTable();
 }
 // Expose to the Vue bundle (which calls toggleTicketStar from its star button).
 window.toggleTicketStar = toggleTicketStar;
 window.isTicketStarred = isTicketStarred;
+
+// ─── UI preferences persistence (per browser, like Starred) ───────
+// Remembers the operator's toolbar choices across a page refresh: the status
+// filter (Active/Open/Pending/Closed/All), the label filter selections
+// (show-only / hide), the "★ Starred only" toggle and the sort column/dir.
+// Stored in localStorage, so it's per browser/user — nothing server-side.
+const UI_PREFS_KEY = 'tickets_ui_prefs';
+function saveUiPrefs() {
+    try {
+        localStorage.setItem(UI_PREFS_KEY, JSON.stringify({
+            statusFilter: currentFilter,
+            labelFilter: labelFilterState,
+            starredOnly: showStarredOnly,
+            sort: currentSort,
+            sortDir: sortDir,
+        }));
+    } catch (e) { /* quota / private mode — ignore */ }
+}
+function loadUiPrefs() {
+    try {
+        const raw = localStorage.getItem(UI_PREFS_KEY);
+        if (!raw) return;
+        const p = JSON.parse(raw);
+        if (typeof p.statusFilter === 'string') currentFilter = p.statusFilter;
+        if (p.labelFilter && typeof p.labelFilter === 'object') labelFilterState = p.labelFilter;
+        if (typeof p.starredOnly === 'boolean') showStarredOnly = p.starredOnly;
+        if (typeof p.sort === 'string') currentSort = p.sort;
+        if (p.sortDir === 1 || p.sortDir === -1) sortDir = p.sortDir;
+    } catch (e) { /* ignore corrupt prefs */ }
+}
+// Sync the toolbar buttons/arrows to the (restored) state after the shell renders.
+function applyUiPrefs() {
+    document.querySelectorAll('#tickets-tab .filter-btn').forEach(b => {
+        if (b.dataset.filter) b.classList.toggle('active', b.dataset.filter === currentFilter);
+    });
+    const starBtn = document.getElementById('starredOnlyBtn');
+    if (starBtn) starBtn.classList.toggle('active', showStarredOnly);
+    document.querySelectorAll('#tickets-tab .sort-arrow').forEach(s => s.textContent = '');
+    const arrow = document.getElementById('sort-' + currentSort);
+    if (arrow) arrow.textContent = sortDir === -1 ? '▼' : '▲';
+}
+
+// ─── Shared ticket labels ─────────────────────────────────────────
+// A common list of coloured labels operators create once (e.g. "Robert",
+// "Chris", "urgent"), assign to any number of tickets, and filter the table
+// by. Unlike Starred (per-browser localStorage) these are SHARED — stored
+// server-side, so everyone sees the same list. Backend: /api/labels + the
+// per-ticket /api/tickets/{id}/labels assignment endpoint.
+let labels = [];                 // [{id, name, color, ticket_count}]
+// Per-label filter state: id -> 'include' (show only these) | 'exclude' (hide these).
+// A label not present in the map is neutral. Clicking a filter chip cycles
+// neutral → include → exclude → neutral.
+let labelFilterState = {};
+
+function labelsById() {
+    const map = {};
+    labels.forEach(l => { map[l.id] = l; });
+    return map;
+}
+
+async function loadLabels() {
+    try {
+        const resp = await fetch(BASE_URL + '/api/labels');
+        const data = await resp.json();
+        labels = Array.isArray(data.labels) ? data.labels : [];
+    } catch (e) {
+        labels = [];
+    }
+    // Drop any filter selections whose label no longer exists.
+    const ids = new Set(labels.map(l => l.id));
+    Object.keys(labelFilterState).forEach(k => { if (!ids.has(Number(k))) delete labelFilterState[k]; });
+    renderLabelFilterBar();
+    if (typeof renderTable === 'function') renderTable();
+    // Let the Vue detail panel (if open) refresh its label chips.
+    if (typeof window.onTicketLabelsChanged === 'function') window.onTicketLabelsChanged();
+}
+
+// Exposed for the Vue ticket-detail panel, which offers the same
+// assign-labels affordance (reuses openLabelPicker + these read helpers).
+window.getAllLabels = () => labels;
+window.getTicketLabelIds = (ticketId) => {
+    const t = tickets.find(x => String(x.id) === String(ticketId));
+    return (t && t._internal && t._internal.label_ids) || [];
+};
+// openLabelPicker is already global (function declaration) — the Vue panel
+// reaches it via window.openLabelPicker. Do NOT reassign it to a wrapper that
+// calls itself, or it recurses infinitely.
+
+function anyLabelFilterActive() {
+    return Object.keys(labelFilterState).length > 0;
+}
+
+function renderLabelFilterBar() {
+    const bar = document.getElementById('labelFilterBar');
+    if (!bar) return;
+    const chips = labels.map(l => {
+        const state = labelFilterState[l.id];          // undefined | 'include' | 'exclude'
+        const cls = state === 'include' ? ' state-include' : state === 'exclude' ? ' state-exclude' : '';
+        const mark = state === 'include' ? '✓ ' : state === 'exclude' ? '⊘ ' : '';
+        const tip = state === 'include' ? `Showing only tickets with "${esc(l.name)}" — click to hide them`
+            : state === 'exclude' ? `Hiding tickets with "${esc(l.name)}" — click to reset`
+            : `Click to show only "${esc(l.name)}"`;
+        return `<button class="label-chip label-filter-chip${cls}" style="--lc:${l.color}" onclick="cycleLabelFilter(${l.id})" title="${tip}">${mark}${esc(l.name)}</button>`;
+    }).join('');
+    bar.innerHTML =
+        `<span class="label-filter-caption">Labels:</span>`
+        + (chips || `<span class="label-filter-empty">none yet — use “Manage labels” to add some</span>`)
+        + (anyLabelFilterActive() ? `<button class="filter-btn" onclick="clearLabelFilter()">Clear</button>` : '');
+}
+
+// neutral → include (show only) → exclude (hide) → neutral
+function cycleLabelFilter(id) {
+    const s = labelFilterState[id];
+    if (!s) labelFilterState[id] = 'include';
+    else if (s === 'include') labelFilterState[id] = 'exclude';
+    else delete labelFilterState[id];
+    saveUiPrefs();
+    renderLabelFilterBar();
+    renderTable();
+}
+
+function clearLabelFilter() {
+    labelFilterState = {};
+    saveUiPrefs();
+    renderLabelFilterBar();
+    renderTable();
+}
+
+// ─── Bulk actions on many tickets ─────────────────────────────────
+// Operators tick the checkbox on each row (or the one in the table header,
+// which takes every ticket currently visible after the filters) and then apply
+// ONE action to the whole selection: set the FreshService status, add a shared
+// label, remove a shared label, or star/unstar.
+//
+// The selection is in-memory only — a refresh clears it. It is also pruned on
+// every render to the tickets still visible, so changing a filter never leaves
+// invisible tickets silently selected (the count always matches what is ticked
+// on screen).
+//
+// Every action reuses the SAME single-ticket endpoints the per-row affordances
+// use, called one ticket at a time — one writer, one behaviour. Stars are
+// per-browser localStorage, so that one never talks to the server at all.
+let selectedTicketIds = new Set();
+
+function isTicketSelected(id) { return selectedTicketIds.has(String(id)); }
+
+function toggleTicketSelection(id, checked) {
+    const sid = String(id);
+    if (checked) selectedTicketIds.add(sid); else selectedTicketIds.delete(sid);
+    renderBulkBar();
+    syncBulkSelectAll();
+    const row = document.querySelector(`#ticketBody tr[data-ticket-id="${sid}"]`);
+    if (row) row.classList.toggle('row-selected', checked);
+}
+
+// Header checkbox: select / clear every ticket the current filters leave visible.
+function toggleSelectAllVisible(checked) {
+    const visible = getFiltered().map(t => String(t.id));
+    if (checked) visible.forEach(id => selectedTicketIds.add(id));
+    else visible.forEach(id => selectedTicketIds.delete(id));
+    renderTable();
+}
+
+function clearTicketSelection() {
+    selectedTicketIds.clear();
+    renderTable();
+}
+
+// Drop anything no longer on screen, so the counter can never claim more than
+// the operator can see.
+function pruneSelection(visibleTickets) {
+    const visible = new Set(visibleTickets.map(t => String(t.id)));
+    Array.from(selectedTicketIds).forEach(id => { if (!visible.has(id)) selectedTicketIds.delete(id); });
+}
+
+function syncBulkSelectAll() {
+    const box = document.getElementById('bulkSelectAll');
+    if (!box) return;
+    const visible = getFiltered().map(t => String(t.id));
+    const picked = visible.filter(id => selectedTicketIds.has(id)).length;
+    box.checked = visible.length > 0 && picked === visible.length;
+    box.indeterminate = picked > 0 && picked < visible.length;
+}
+
+function renderBulkBar() {
+    const bar = document.getElementById('bulkActionBar');
+    if (!bar) return;
+    const n = selectedTicketIds.size;
+    bar.style.display = n ? '' : 'none';
+    if (!n) return;
+    const countEl = document.getElementById('bulkSelectionCount');
+    if (countEl) countEl.textContent = `${n} ticket${n === 1 ? '' : 's'} selected`;
+}
+
+// ── The four action menus ──
+// All four share one popover element, so opening any of them closes the others.
+function closeBulkMenu() {
+    const m = document.getElementById('bulkMenu');
+    if (m) m.remove();
+    window.ModalStack.remove('bulkMenu');
+}
+
+function openBulkMenu(event, caption, itemsHtml) {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+    closeBulkMenu();
+    const menu = document.createElement('div');
+    menu.className = 'status-picker bulk-menu';
+    menu.id = 'bulkMenu';
+    menu.addEventListener('click', e => e.stopPropagation());
+    menu.innerHTML = `<div class="status-picker-caption">${caption}</div>`
+        + itemsHtml
+        + `<button class="status-picker-cancel" onclick="closeBulkMenu()">Cancel</button>`;
+    document.body.appendChild(menu);
+    const r = event.currentTarget.getBoundingClientRect();
+    menu.style.top = (window.scrollY + r.bottom + 4) + 'px';
+    const left = Math.min(window.scrollX + r.left, window.scrollX + window.innerWidth - 220);
+    menu.style.left = Math.max(8, left) + 'px';
+    window.ModalStack.push({ id: 'bulkMenu', close: closeBulkMenu });
+}
+
+function openBulkStatusMenu(event) {
+    openBulkMenu(event, 'Set FreshService status', STATUS_CHOICES.map(s =>
+        `<button class="status-picker-item bulk-menu-item" data-status="${s.key}" onclick="runBulkStatus('${s.key}')">
+            <span class="badge badge-${s.cls}">${s.label}</span>
+        </button>`).join(''));
+}
+
+function bulkLabelItems(mode) {
+    if (!labels.length) return `<div class="label-picker-empty">No labels yet</div>`;
+    return labels.map(l =>
+        `<button class="status-picker-item bulk-menu-item" data-label-id="${l.id}" onclick="runBulkLabel('${mode}', ${l.id})">
+            <span class="label-chip" style="--lc:${l.color}">${esc(l.name)}</span>
+        </button>`).join('');
+}
+
+function openBulkAddLabelMenu(event) { openBulkMenu(event, 'Add label to selected', bulkLabelItems('add')); }
+function openBulkRemoveLabelMenu(event) { openBulkMenu(event, 'Remove label from selected', bulkLabelItems('remove')); }
+
+function openBulkStarMenu(event) {
+    openBulkMenu(event, 'Stars (only you see these)',
+        `<button class="status-picker-item bulk-menu-item" data-star="on" onclick="runBulkStar(true)">★ Star selected</button>`
+        + `<button class="status-picker-item bulk-menu-item" data-star="off" onclick="runBulkStar(false)">☆ Unstar selected</button>`);
+}
+
+// ── Running an action over the selection ──
+// Tickets are processed one at a time (the endpoints are per-ticket and each
+// one talks to FreshService); the operator gets a single "X succeeded, Y errors"
+// summary at the end rather than a dialog per ticket.
+function selectedTicketsInOrder() {
+    return getFiltered().filter(t => selectedTicketIds.has(String(t.id)));
+}
+
+function showBulkToast(message, isError) {
+    const el = document.getElementById('bulkToast');
+    if (!el) return;
+    el.textContent = message;
+    el.classList.toggle('bulk-toast-error', !!isError);
+    el.style.display = '';
+    clearTimeout(showBulkToast._timer);
+    showBulkToast._timer = setTimeout(() => { el.style.display = 'none'; }, 6000);
+}
+
+function bulkSummary(ok, failed) {
+    return `Done: ${ok} succeeded, ${failed} error${failed === 1 ? '' : 's'}.`;
+}
+
+function setBulkBarBusy(busy) {
+    const bar = document.getElementById('bulkActionBar');
+    if (bar) bar.classList.toggle('bulk-busy', busy);
+}
+
+async function runBulkStatus(statusKey) {
+    const chosen = STATUS_CHOICES.find(s => s.key === statusKey);
+    const targets = selectedTicketsInOrder();
+    closeBulkMenu();
+    if (!chosen || !targets.length) return;
+
+    const ok = window.confirm(
+        `Set ${targets.length} ticket${targets.length === 1 ? '' : 's'} to "${chosen.label}"?\n\n`
+        + `This changes the status on FreshService and moves the tickets on our pipeline.`
+    );
+    if (!ok) return;
+
+    setBulkBarBusy(true);
+    let done = 0, failed = 0;
+    for (const t of targets) {
+        try {
+            const resp = await fetch(BASE_URL + '/api/tickets/' + encodeURIComponent(t.id) + '/status', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                body: JSON.stringify({ status: statusKey, reason: 'Changed from the tickets list (bulk action)' }),
+            });
+            if (!resp.ok) failed++; else done++;
+        } catch (e) {
+            failed++;
+        }
+    }
+    setBulkBarBusy(false);
+    showBulkToast(bulkSummary(done, failed), failed > 0);
+    selectedTicketIds.clear();
+    await loadTickets();
+}
+
+// mode: 'add' adds the label on top of whatever each ticket already carries;
+// 'remove' takes only that one off. Neither ever replaces a ticket's set, so
+// labels put on by someone else survive.
+async function runBulkLabel(mode, labelId) {
+    const label = labels.find(l => l.id === labelId);
+    const targets = selectedTicketsInOrder();
+    closeBulkMenu();
+    if (!label || !targets.length) return;
+
+    const verb = mode === 'add' ? 'Add' : 'Remove';
+    const prep = mode === 'add' ? 'to' : 'from';
+    const ok = window.confirm(
+        `${verb} label "${label.name}" ${prep} ${targets.length} ticket${targets.length === 1 ? '' : 's'}?`
+    );
+    if (!ok) return;
+
+    setBulkBarBusy(true);
+    let done = 0, failed = 0;
+    for (const t of targets) {
+        const current = new Set((t._internal && t._internal.label_ids) || []);
+        if (mode === 'add') current.add(labelId); else current.delete(labelId);
+        const ids = Array.from(current);
+        try {
+            const resp = await fetch(BASE_URL + '/api/tickets/' + encodeURIComponent(t.id) + '/labels', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ label_ids: ids }),
+            });
+            if (!resp.ok) { failed++; continue; }
+            const data = await resp.json();
+            if (!t._internal) t._internal = {};
+            t._internal.label_ids = data.label_ids;
+            done++;
+        } catch (e) {
+            failed++;
+        }
+    }
+    setBulkBarBusy(false);
+    showBulkToast(bulkSummary(done, failed), failed > 0);
+    selectedTicketIds.clear();
+    renderTable();
+    loadLabels();
+}
+
+// Stars live in this browser only, so this one is instant and needs no
+// confirmation — nothing leaves the machine and nobody else is affected.
+function runBulkStar(on) {
+    const targets = selectedTicketsInOrder();
+    closeBulkMenu();
+    if (!targets.length) return;
+    targets.forEach(t => {
+        const sid = String(t.id);
+        if (on) starredTickets.add(sid); else starredTickets.delete(sid);
+    });
+    saveStarredTickets(starredTickets);
+    renderTable();
+    targets.forEach(t => {
+        if (typeof window.onTicketStarChanged === 'function') window.onTicketStarChanged(String(t.id));
+    });
+}
+
+// Close the bulk menu on any outside click (the buttons stop their own clicks).
+document.addEventListener('click', e => {
+    const menu = document.getElementById('bulkMenu');
+    if (menu && !menu.contains(e.target)) closeBulkMenu();
+});
+
+// ─── Per-row FreshService status picker ───────────────────────────
+// Change a ticket's FS status straight from the list, without opening the
+// detail panel. Same endpoint the detail panel's "Set status" menu uses
+// (POST /api/tickets/{id}/status) — one writer, one behaviour.
+//
+// Closing/resolving is destructive-ish and outward-facing (it changes state on
+// FreshService and moves the ticket's pipeline section), so those two ask for
+// confirmation first. Open/Pending are freely reversible and don't.
+const STATUS_CHOICES = [
+    { key: 'open',     label: 'Open',     code: 2, cls: 'open' },
+    { key: 'pending',  label: 'Pending',  code: 3, cls: 'pending' },
+    { key: 'resolved', label: 'Resolved', code: 4, cls: 'resolved' },
+    { key: 'closed',   label: 'Closed',   code: 5, cls: 'closed' },
+];
+
+function openStatusPicker(event, ticketId) {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+    closeStatusPicker();
+    const t = tickets.find(x => String(x.id) === String(ticketId));
+    if (!t) return;
+
+    const menu = document.createElement('div');
+    menu.className = 'status-picker';
+    menu.id = 'statusPicker';
+    menu.addEventListener('click', e => e.stopPropagation());
+    menu.innerHTML =
+        `<div class="status-picker-caption">Set FreshService status</div>`
+        + STATUS_CHOICES.map(s => {
+            const isCurrent = t.status === s.code;
+            return `<button class="status-picker-item${isCurrent ? ' current' : ''}"
+                        ${isCurrent ? 'disabled title="Already this status"' : `onclick="pickTicketStatus(event, '${ticketId}', '${s.key}')"`}>
+                        <span class="badge badge-${s.cls}">${s.label}</span>
+                        ${isCurrent ? '<span class="status-picker-current-mark">current</span>' : ''}
+                    </button>`;
+        }).join('')
+        + `<button class="status-picker-cancel" onclick="closeStatusPicker()">Cancel</button>`;
+
+    document.body.appendChild(menu);
+    const r = event.currentTarget.getBoundingClientRect();
+    menu.style.top = (window.scrollY + r.bottom + 4) + 'px';
+    const left = Math.min(window.scrollX + r.left, window.scrollX + window.innerWidth - 200);
+    menu.style.left = Math.max(8, left) + 'px';
+    window.ModalStack.push({ id: 'statusPicker', close: closeStatusPicker });
+}
+
+function closeStatusPicker() {
+    const m = document.getElementById('statusPicker');
+    if (m) m.remove();
+    window.ModalStack.remove('statusPicker');
+}
+
+async function pickTicketStatus(event, ticketId, statusKey) {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+
+    // Resolved/Closed change state on FreshService AND move the ticket's
+    // pipeline section — confirm before doing it from a one-click list badge,
+    // where a misclick is easy.
+    if (statusKey === 'resolved' || statusKey === 'closed') {
+        const ok = window.confirm(
+            `Set ticket #${ticketId} to ${statusKey === 'closed' ? 'Closed' : 'Resolved'}?\n\n`
+            + `This changes the status on FreshService and moves the ticket on our pipeline.`
+        );
+        if (!ok) return;
+    }
+
+    closeStatusPicker();
+    try {
+        const resp = await fetch(BASE_URL + '/api/tickets/' + encodeURIComponent(ticketId) + '/status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ status: statusKey, reason: 'Changed from the tickets list' }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            alert('Could not change status: ' + (data.error || ('HTTP ' + resp.status))
+                + (data.message ? '\n' + data.message : ''));
+            return;
+        }
+        // Re-pull from the server rather than patching the row locally: the
+        // endpoint may also have moved the pipeline section, and that column
+        // is rendered from the same payload.
+        await loadTickets();
+    } catch (e) {
+        alert('Could not change status: ' + (e.message || e));
+    }
+}
+
+// ── Per-ticket assignment popover ──
+function openLabelPicker(event, ticketId) {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+    closeLabelPicker();
+    const menu = document.createElement('div');
+    menu.className = 'label-picker';
+    menu.id = 'labelPicker';
+    menu.dataset.ticketId = String(ticketId);
+    // Clicks inside the popover must never bubble to the document close handler,
+    // so toggling a row keeps the popover open (multi-select without native
+    // <label> forwarding quirks — the whole row is one toggle target).
+    menu.addEventListener('click', e => e.stopPropagation());
+    renderLabelPickerItems(menu, ticketId);
+    document.body.appendChild(menu);
+    const r = event.target.getBoundingClientRect();
+    menu.style.top = (window.scrollY + r.bottom + 4) + 'px';
+    // Keep the menu on-screen horizontally.
+    const left = Math.min(window.scrollX + r.left, window.scrollX + window.innerWidth - 240);
+    menu.style.left = Math.max(8, left) + 'px';
+    window.ModalStack.push({ id: 'labelPicker', close: closeLabelPicker });
+}
+
+function renderLabelPickerItems(menu, ticketId) {
+    const t = tickets.find(x => String(x.id) === String(ticketId));
+    const current = new Set((t && t._internal && t._internal.label_ids) || []);
+    const items = labels.length
+        ? labels.map(l => {
+            const on = current.has(l.id);
+            // Two targets: the checkbox toggles in multi-select and keeps the
+            // popover open; clicking the label NAME picks only that one and
+            // closes the popover immediately.
+            return `<div class="label-picker-item${on ? ' checked' : ''}">
+                <span class="label-picker-check" onclick="toggleTicketLabel(event, '${ticketId}', ${l.id})" title="Toggle (keeps this open for multiple)">${on ? '✓' : ''}</span>
+                <span class="label-chip" style="--lc:${l.color}" onclick="pickSingleLabel(event, '${ticketId}', ${l.id})" title="Pick only this one and close">${esc(l.name)}</span>
+            </div>`;
+        }).join('')
+        : `<div class="label-picker-empty">No labels yet</div>`;
+    menu.innerHTML = items
+        + `<button class="label-picker-manage" onclick="openLabelManager()">Manage labels…</button>`
+        + `<button class="label-picker-done" onclick="closeLabelPicker()">Done</button>`;
+}
+
+function closeLabelPicker() {
+    const m = document.getElementById('labelPicker');
+    if (m) m.remove();
+    window.ModalStack.remove('labelPicker');
+}
+
+// Click on the label NAME: ADD this label to the ticket's existing set (never
+// removes anything already assigned) and close the popover immediately.
+async function pickSingleLabel(event, ticketId, labelId) {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+    const t = tickets.find(x => String(x.id) === String(ticketId));
+    if (!t) return;
+    const set = new Set((t._internal && t._internal.label_ids) || []);
+    set.add(labelId);
+    await saveTicketLabels(ticketId, Array.from(set));
+    closeLabelPicker();
+}
+
+// Click on the checkbox: toggle this label in/out, keep the popover open so
+// several can be selected in one go.
+async function toggleTicketLabel(event, ticketId, labelId) {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+    const t = tickets.find(x => String(x.id) === String(ticketId));
+    if (!t) return;
+    const set = new Set((t._internal && t._internal.label_ids) || []);
+    if (set.has(labelId)) set.delete(labelId); else set.add(labelId);
+    await saveTicketLabels(ticketId, Array.from(set), { keepOpen: true });
+}
+
+// Persist a ticket's full label set and refresh the row, counts and (optionally)
+// the open popover.
+async function saveTicketLabels(ticketId, ids, { keepOpen = false } = {}) {
+    const t = tickets.find(x => String(x.id) === String(ticketId));
+    if (!t) return;
+    if (!t._internal) t._internal = {};
+    try {
+        const resp = await fetch(BASE_URL + '/api/tickets/' + encodeURIComponent(ticketId) + '/labels', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ label_ids: ids }),
+        });
+        if (!resp.ok) throw new Error('save failed (' + resp.status + ')');
+        const data = await resp.json();
+        t._internal.label_ids = data.label_ids;
+        // When staying open (checkbox multi-select), refresh the popover in
+        // place so the ticks update. The row chips + shared counts always refresh.
+        if (keepOpen) {
+            const menu = document.getElementById('labelPicker');
+            if (menu && menu.dataset.ticketId === String(ticketId)) renderLabelPickerItems(menu, ticketId);
+        }
+        renderTable();
+        loadLabels();
+    } catch (e) {
+        alert('Failed to save labels: ' + e.message);
+    }
+}
+
+// ── Label manager modal (create / delete the shared list) ──
+function openLabelManager() {
+    closeLabelPicker();
+    renderLabelManagerList();
+    const err = document.getElementById('labelCreateError');
+    if (err) err.textContent = '';
+    document.getElementById('labelManagerModal')?.classList.add('open');
+    window.ModalStack.push({ id: 'labelManagerModal', close: closeLabelManager });
+}
+
+function closeLabelManager() {
+    document.getElementById('labelManagerModal')?.classList.remove('open');
+    window.ModalStack.remove('labelManagerModal');
+}
+
+function renderLabelManagerList() {
+    const box = document.getElementById('labelManagerList');
+    if (!box) return;
+    if (!labels.length) {
+        box.innerHTML = `<div class="label-manager-empty">No labels yet — add your first one below.</div>`;
+        return;
+    }
+    box.innerHTML = labels.map(l => `
+        <div class="label-manager-row">
+            <span class="label-chip" style="--lc:${l.color}">${esc(l.name)}</span>
+            <span class="label-manager-count">${l.ticket_count} ticket${l.ticket_count === 1 ? '' : 's'}</span>
+            <button class="label-delete-btn" onclick="deleteLabelPrompt(${l.id})" title="Delete this label">Delete</button>
+        </div>`).join('');
+}
+
+async function createLabel() {
+    const nameEl = document.getElementById('newLabelName');
+    const colorEl = document.getElementById('newLabelColor');
+    const errEl = document.getElementById('labelCreateError');
+    const name = (nameEl.value || '').trim();
+    const color = colorEl.value || '#3b82f6';
+    errEl.textContent = '';
+    if (!name) { errEl.textContent = 'Enter a name.'; return; }
+    try {
+        const resp = await fetch(BASE_URL + '/api/labels', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, color }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) { errEl.textContent = data.message || 'Could not create label.'; return; }
+        nameEl.value = '';
+        await loadLabels();
+        renderLabelManagerList();
+    } catch (e) {
+        errEl.textContent = 'Could not create label: ' + e.message;
+    }
+}
+
+async function deleteLabelPrompt(id) {
+    const l = labels.find(x => x.id === id);
+    if (!l) return;
+    const n = l.ticket_count;
+    const warning = n > 0
+        ? `Delete label "${l.name}"?\n\nIt is currently used on ${n} ticket${n === 1 ? '' : 's'} and will be removed from ${n === 1 ? 'it' : 'them'}.`
+        : `Delete label "${l.name}"?`;
+    if (!confirm(warning)) return;
+    try {
+        const resp = await fetch(BASE_URL + '/api/labels/' + id, { method: 'DELETE' });
+        if (!resp.ok) throw new Error('delete failed (' + resp.status + ')');
+        await loadLabels();
+        renderLabelManagerList();
+    } catch (e) {
+        alert('Failed to delete label: ' + e.message);
+    }
+}
+
+// Close the assignment popover on any outside click.
+document.addEventListener('click', e => {
+    const picker = document.getElementById('labelPicker');
+    if (picker && !picker.contains(e.target) && !(e.target.classList && e.target.classList.contains('label-add-btn'))) {
+        closeLabelPicker();
+    }
+});
+
+// Same for the per-row status picker. (The badge's own click stops
+// propagation, so opening one never trips this handler.)
+document.addEventListener('click', e => {
+    const picker = document.getElementById('statusPicker');
+    if (picker && !picker.contains(e.target)) {
+        closeStatusPicker();
+    }
+});
 
 let agentSort = 'created_at';
 let agentSortDir = -1;
@@ -157,6 +832,7 @@ function renderApp() {
                     <span class="fs-health-label" id="fsHealthLabel">checking…</span>
                 </button>
                 <button class="refresh-btn" onclick="loadTickets()">&#x21bb; Refresh</button>
+                <button class="manage-labels-btn" onclick="openLabelManager()" title="Create, colour and delete shared labels">&#127991; Manage labels</button>
                 <a href="${TICKETS_API}" target="_blank" class="json-link">JSON</a>
                 <a href="/www/freshservice-tickets-db.json" target="_blank" class="json-link">DB File</a>
                 <span class="last-updated" id="lastUpdated"></span>
@@ -171,10 +847,22 @@ function renderApp() {
                 <button class="filter-btn" data-filter="closed" onclick="setFilter('closed')">Closed</button>
                 <button class="filter-btn filter-btn-starred" id="starredOnlyBtn" onclick="toggleStarredOnlyFilter()" title="Show only tickets you have starred">★ Starred only</button>
             </div>
+            <div class="label-filter-bar" id="labelFilterBar"></div>
+            <div class="bulk-action-bar" id="bulkActionBar" style="display:none;">
+                <span class="bulk-selection-count" id="bulkSelectionCount">0 tickets selected</span>
+                <button class="filter-btn" id="bulkStatusBtn" onclick="openBulkStatusMenu(event)">Status &#x25BE;</button>
+                <button class="filter-btn" id="bulkAddLabelBtn" onclick="openBulkAddLabelMenu(event)">Add label &#x25BE;</button>
+                <button class="filter-btn" id="bulkRemoveLabelBtn" onclick="openBulkRemoveLabelMenu(event)">Remove label &#x25BE;</button>
+                <button class="filter-btn" id="bulkStarBtn" onclick="openBulkStarMenu(event)">&#9733; &#x25BE;</button>
+                <button class="filter-btn bulk-clear-btn" id="bulkClearBtn" onclick="clearTicketSelection()">Clear selection</button>
+            </div>
+            <div class="bulk-toast" id="bulkToast" style="display:none;"></div>
             <table>
                 <thead><tr>
+                    <th class="bulk-col"><input type="checkbox" id="bulkSelectAll" class="bulk-select-box" onchange="toggleSelectAllVisible(this.checked)" title="Select every ticket currently visible"></th>
                     <th class="star-col" title="Star this ticket — toggles the per-row marker"></th>
                     <th onclick="sortBy('category')">Category <span class="sort-arrow" id="sort-category">&#x25B2;</span></th>
+                    <th class="labels-col">Labels</th>
                     <th onclick="sortBy('id')">ID <span class="sort-arrow" id="sort-id"></span></th>
                     <th onclick="sortBy('status')">FreshService Status <span class="sort-arrow" id="sort-status"></span></th>
                     <th onclick="sortBy('pipeline_section')">Pipeline Stage <span class="sort-arrow" id="sort-pipeline_section"></span></th>
@@ -291,7 +979,7 @@ function renderApp() {
                     <button class="mtab" data-mtab="output" onclick="switchModalTab('output')">Output</button>
                 </div>
                 <div class="modal-body">
-                    <pre id="modalPrompt" class="mtab-content active"></pre>
+                    <div id="modalPrompt" class="mtab-content active md-body"></div>
                     <div id="modalOutput" class="mtab-content output-formatted"></div>
                 </div>
             </div>
@@ -304,6 +992,24 @@ function renderApp() {
                     <button class="modal-close" onclick="closeFsHealthModal()">&times;</button>
                 </div>
                 <div class="modal-body" id="fsHealthModalBody"></div>
+            </div>
+        </div>
+
+        <div class="modal" id="labelManagerModal">
+            <div class="modal-content label-manager-content">
+                <div class="modal-header">
+                    <h2>Manage labels</h2>
+                    <button class="modal-close" onclick="closeLabelManager()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div id="labelManagerList"></div>
+                    <div class="label-create-row">
+                        <input type="text" id="newLabelName" placeholder="New label name" maxlength="40" onkeydown="if(event.key==='Enter')createLabel()">
+                        <input type="color" id="newLabelColor" value="#3b82f6" title="Label colour">
+                        <button class="filter-btn label-create-btn" onclick="createLabel()">Add label</button>
+                    </div>
+                    <div class="label-create-error" id="labelCreateError"></div>
+                </div>
             </div>
         </div>
     `;
@@ -450,7 +1156,7 @@ async function loadTickets() {
         renderTable();
     } catch (e) {
         document.getElementById('ticketBody').innerHTML =
-            '<tr><td colspan="12" class="empty">Failed to load tickets: ' + e.message + '</td></tr>';
+            '<tr><td colspan="14" class="empty">Failed to load tickets: ' + e.message + '</td></tr>';
     }
 }
 
@@ -535,7 +1241,10 @@ async function loadAgents() {
 // fix at the source — not a defensive filter to add here.
 function isInternallyParked(t) {
     const sec = (t._internal && t._internal.pipeline_section) || '';
-    return sec === 'Spam' || sec === 'Closed';
+    // FreshService's own spam flag counts too: such a ticket keeps a normal
+    // Open status, so without this it sits in the Active/Open queue forever
+    // even though FreshService has already judged it as spam.
+    return sec === 'Spam' || sec === 'Closed' || t.spam === true;
 }
 
 function renderStats() {
@@ -580,11 +1289,23 @@ function renderAgentStats() {
 
 function getFiltered() {
     const search = document.getElementById('search').value.toLowerCase();
+    const lblMap = labelsById();
+    // Split the label filter into include (show only) / exclude (hide) sets once.
+    const includeIds = [], excludeIds = [];
+    for (const [id, state] of Object.entries(labelFilterState)) {
+        (state === 'exclude' ? excludeIds : includeIds).push(Number(id));
+    }
     return tickets.filter(t => {
         // Starred-only filter is layered ON TOP of the status filter — when
         // active, the status filter still applies, but only starred tickets
         // pass the gate.
         if (showStarredOnly && !isTicketStarred(t.id)) return false;
+        // Label filter. Exclude wins: a ticket carrying ANY hidden label is
+        // dropped. Otherwise, if any "show only" labels are active, the ticket
+        // must carry AT LEAST ONE of them (OR).
+        const ticketLabelIds = (t._internal && t._internal.label_ids) || [];
+        if (excludeIds.length && ticketLabelIds.some(id => excludeIds.includes(id))) return false;
+        if (includeIds.length && !ticketLabelIds.some(id => includeIds.includes(id))) return false;
         // Internally-parked tickets (## Spam, ## Closed) never show in Active /
         // Open / Pending — that's the whole point of those sections.
         if (['active', 'open', 'pending'].includes(currentFilter) && isInternallyParked(t)) return false;
@@ -593,7 +1314,8 @@ function getFiltered() {
         else if (currentFilter === 'pending') { if (t.status !== 3 || t.deleted) return false; }
         else if (currentFilter === 'closed') { if (![4, 5].includes(t.status) && !t.deleted) return false; }
         if (search) {
-            const hay = `${t.id} ${t.subject} ${t.requester_name} ${t.category}`.toLowerCase();
+            const labelNames = ticketLabelIds.map(id => (lblMap[id] && lblMap[id].name) || '').join(' ');
+            const hay = `${t.id} ${t.subject} ${t.requester_name} ${t.category} ${labelNames}`.toLowerCase();
             if (!hay.includes(search)) return false;
         }
         return true;
@@ -610,8 +1332,14 @@ function renderTable() {
         return 0;
     });
 
+    // Keep the selection honest: only tickets the operator can still see stay
+    // selected, so the bulk counter always matches the ticked boxes on screen.
+    pruneSelection(filtered);
+
     if (!filtered.length) {
-        document.getElementById('ticketBody').innerHTML = '<tr><td colspan="13" class="empty">No tickets found</td></tr>';
+        document.getElementById('ticketBody').innerHTML = '<tr><td colspan="15" class="empty">No tickets found</td></tr>';
+        renderBulkBar();
+        syncBulkSelectAll();
         return;
     }
 
@@ -619,30 +1347,43 @@ function renderTable() {
         const statusClass = t.status === 2 ? 'open' : t.status === 3 ? 'pending' : t.status === 10 ? 'notification' : t.status === 5 ? 'closed' : 'resolved';
         const catClass = (t.category || '').toLowerCase().replace(/[^a-z]/g, '');
         const prioClass = (PRIORITY_MAP[t.priority] || '').toLowerCase();
-        const created = t.created_at ? new Date(t.created_at).toLocaleDateString('en-IE', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
-        const updated = t.updated_at ? new Date(t.updated_at).toLocaleDateString('en-IE', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
+        const created = compactLocalTime(t.created_at);
+        const updated = compactLocalTime(t.updated_at);
         const pipelineSection = t._internal.pipeline_section || '';
         const pipelineSlug = pipelineSection.toLowerCase().replace(/[^a-z]+/g, '-').replace(/(^-|-$)/g, '');
         const starred = isTicketStarred(t.id);
-        return `<tr${starred ? ' class="row-starred"' : ''}>
+        const lblMap = labelsById();
+        const labelChipsHtml = ((t._internal.label_ids) || [])
+            .map(id => lblMap[id])
+            .filter(Boolean)
+            .map(l => `<span class="label-chip" style="--lc:${l.color}">${esc(l.name)}</span>`)
+            .join('');
+        const selected = isTicketSelected(t.id);
+        const rowCls = [starred ? 'row-starred' : '', selected ? 'row-selected' : ''].filter(Boolean).join(' ');
+        return `<tr data-ticket-id="${t.id}"${rowCls ? ` class="${rowCls}"` : ''}>
+            <td class="bulk-col"><input type="checkbox" class="bulk-select-box" data-ticket-id="${t.id}" ${selected ? 'checked' : ''} onchange="toggleTicketSelection('${t.id}', this.checked)" title="Select for bulk actions"></td>
             <td class="star-col"><span class="ticket-star ${starred ? 'starred' : ''}" onclick="toggleTicketStar('${t.id}', event)" title="${starred ? 'Unstar' : 'Star this ticket'}">${starred ? '★' : '☆'}</span></td>
             <td><span class="category category-${catClass}">${t.category || '-'}</span></td>
+            <td class="labels-cell">${labelChipsHtml}<button class="label-add-btn" onclick="openLabelPicker(event, '${t.id}')" title="Assign labels">+</button></td>
             <td>
                 <a href="https://youritsolutions.freshservice.com/a/tickets/${t.id}" target="_blank">#${t.id}</a>
                 <a href="#" class="ticket-detail-link" onclick="openTicketDetailFromTable(event, '${t.id}')" title="Open inline detail viewer">Details</a>
             </td>
-            <td><span class="badge badge-${statusClass}">${STATUS_MAP[t.status] || t.status}</span></td>
+            <td><button type="button" class="badge badge-${statusClass} badge-status-btn" onclick="openStatusPicker(event, '${t.id}')" title="Click to change the FreshService status">${STATUS_MAP[t.status] || t.status || '—'}<span class="badge-status-caret">▾</span></button></td>
             <td class="pipeline-stage">${pipelineSection ? `<span class="badge badge-stage badge-stage-${pipelineSlug}">${esc(pipelineSection)}</span>` : '<span class="badge badge-stage-none">—</span>'}</td>
             <td class="priority-${prioClass}">${PRIORITY_MAP[t.priority] || t.priority}</td>
-            <td class="subject" title="${esc(t.subject)}">${esc(t.subject)}</td>
+            <td class="subject" title="${esc(t.subject)}">${t.spam ? '<span class="badge badge-spam" title="FreshService marked this ticket as spam">SPAM</span> ' : ''}${esc(t.subject)}</td>
             <td class="requester" title="${esc(t.requester_name)}">${esc(t.requester_name)}</td>
-            <td class="timestamp">${created}</td>
-            <td class="timestamp">${updated}</td>
+            <td class="timestamp" title="${esc(created.utc)}">${created.text}</td>
+            <td class="timestamp" title="${esc(updated.utc)}">${updated.text}</td>
             <td class="internal-summary" title="${esc(t._internal.summary)}">${esc(t._internal.summary)}</td>
             <td class="internal-action">${esc(t._internal.next_action)}</td>
             <td>${t._internal.ticket_file ? '<a href="' + t._internal.ticket_file + '" target="_blank">View</a>' : ''}</td>
         </tr>`;
     }).join('');
+
+    renderBulkBar();
+    syncBulkSelectAll();
 }
 
 // ─── Ticket Detail viewer (Vue) ─────────────────────────────────
@@ -670,14 +1411,35 @@ function esc(str) {
     return div.innerHTML;
 }
 
+/**
+ * Table-width timestamp in the viewer's zone: `{ text, utc }`.
+ *
+ * The table columns are narrow, so the date stays in the compact
+ * "07 Aug 11:55 CEST" shape rather than the panel's full form — but it carries
+ * the same zone abbreviation, and the same stored-UTC tooltip, so a time read
+ * in the list and the same time read in the panel can never disagree.
+ */
+function compactLocalTime(value) {
+    const L = window.LocalTime;
+    const d = L ? L.parse(value) : (value ? new Date(value) : null);
+    if (!d || isNaN(d.getTime())) return { text: '', utc: '' };
+    const day = String(d.getDate()).padStart(2, '0');
+    const mon = d.toLocaleString('en-IE', { month: 'short' });
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const zone = L ? ' ' + L.zoneAbbr(d) : '';
+    return { text: `${day} ${mon} ${hh}:${mm}${zone}`, utc: L ? L.utc(d) : '' };
+}
+
 function formatTime(iso) {
     if (!iso) return '-';
-    const d = new Date(iso);
-    const day = d.getDate().toString().padStart(2, '0');
-    const mon = d.toLocaleString('en-IE', { month: 'short' });
-    const hh = d.getHours().toString().padStart(2, '0');
-    const mm = d.getMinutes().toString().padStart(2, '0');
-    return `${day} ${mon} ${hh}:${mm}`;
+    return compactLocalTime(iso).text || '-';
+}
+
+/** A `<td>` showing a timestamp in the viewer's zone, stored UTC on hover. */
+function timestampCell(value) {
+    const t = compactLocalTime(value);
+    return `<td class="timestamp" title="${esc(t.utc)}">${t.text || '-'}</td>`;
 }
 
 function formatDurationSec(sec) {
@@ -741,9 +1503,9 @@ function agentCellValue(t, col) {
         case 'username':     return `<td class="user">${esc(t.username || '-')}</td>`;
         case 'source':       return `<td class="source"><span class="source-badge source-${esc(t.source || 'unknown')}">${esc(t.source || '-')}</span></td>`;
         case 'status':       return `<td><span class="agent-status agent-status-${t.status}">${t.status}</span></td>`;
-        case 'created_at':   return `<td class="timestamp">${formatTime(t.created_at)}</td>`;
-        case 'started_at':   return `<td class="timestamp">${formatTime(t.started_at)}</td>`;
-        case 'completed_at': return `<td class="timestamp">${formatTime(t.completed_at)}</td>`;
+        case 'created_at':   return timestampCell(t.created_at);
+        case 'started_at':   return timestampCell(t.started_at);
+        case 'completed_at': return timestampCell(t.completed_at);
         case 'duration':     return `<td class="timestamp ${isRunning ? 'agent-tick' : ''}" ${isRunning && startTs ? `data-start="${startTs}"` : ''}>${t.duration_ms != null ? formatDurationSec(Math.round(t.duration_ms / 1000)) : formatDuration(t.started_at, t.completed_at)}</td>`;
         case 'queue_wait':   return `<td class="timestamp">${t.queue_wait_seconds != null ? formatDurationSec(t.queue_wait_seconds) : '-'}</td>`;
         case 'cost_usd':     return `<td class="cost">${formatCost(t.cost_usd)}</td>`;
@@ -821,7 +1583,7 @@ function openAgentModal(row) {
     currentAgentId = row.dataset.id;
     const status = row.dataset.status;
     document.getElementById('modalTitle').textContent = currentAgentId || 'Task';
-    document.getElementById('modalPrompt').textContent = (row.dataset.prompt || '').replace(/\\n/g, '\n');
+    document.getElementById('modalPrompt').innerHTML = renderMarkdown((row.dataset.prompt || '').replace(/\\n/g, '\n'));
     document.getElementById('modalOutput').textContent = '';
 
     document.querySelectorAll('.mtab').forEach(t => t.classList.remove('active'));
@@ -829,6 +1591,7 @@ function openAgentModal(row) {
     document.querySelectorAll('.mtab-content').forEach(c => c.classList.remove('active'));
     document.getElementById('modalPrompt').classList.add('active');
     document.getElementById('agentModal').classList.add('open');
+    window.ModalStack.push({ id: 'agentModal', close: closeAgentModal });
 
     if (agentOutputInterval) clearInterval(agentOutputInterval);
     if (status === 'running') {
@@ -914,6 +1677,7 @@ async function loadAgentOutput(taskId) {
 function closeAgentModal() {
     document.getElementById('agentModal').classList.remove('open');
     if (agentOutputInterval) { clearInterval(agentOutputInterval); agentOutputInterval = null; }
+    window.ModalStack.remove('agentModal');
 }
 
 // ─── Live duration ticker ───────────────────────────────────────
@@ -932,6 +1696,7 @@ setInterval(() => {
 function setFilter(f) {
     currentFilter = f;
     document.querySelectorAll('#tickets-tab .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
+    saveUiPrefs();
     renderTable();
 }
 
@@ -945,6 +1710,7 @@ function sortBy(col) {
     if (currentSort === col) { sortDir *= -1; } else { currentSort = col; sortDir = -1; }
     document.querySelectorAll('#tickets-tab .sort-arrow').forEach(s => s.textContent = '');
     document.getElementById('sort-' + col).textContent = sortDir === -1 ? '\u25BC' : '\u25B2';
+    saveUiPrefs();
     renderTable();
 }
 
@@ -955,7 +1721,9 @@ function agentSortBy(col) {
 
 // ─── Init ────────────────────────────────────────────────────────
 
+loadUiPrefs();   // restore the operator's toolbar choices before the first render
 renderApp();
+applyUiPrefs();  // reflect the restored status filter / starred / sort on the buttons
 
 const VALID_TABS = ['tickets', 'agents', 'task-lists', 'feedback', 'ai-sessions'];
 const initialTab = window.location.hash.replace('#', '') || 'tickets';
@@ -966,6 +1734,7 @@ window.addEventListener('hashchange', () => {
 });
 
 loadTickets();
+loadLabels();
 // Auto-refresh the ACTIVE tab every 30s so the panel always shows current data.
 // Skipped while the browser tab is hidden, to avoid pointless background fetches.
 setInterval(() => {
@@ -1162,10 +1931,12 @@ function openFsHealthModal() {
     if (!modal) return;
     renderFsHealthModalBody();
     modal.classList.add('open');
+    window.ModalStack.push({ id: 'fsHealthModal', close: closeFsHealthModal });
 }
 
 function closeFsHealthModal() {
     document.getElementById('fsHealthModal')?.classList.remove('open');
+    window.ModalStack.remove('fsHealthModal');
 }
 
 function renderFsHealthModalBody() {
@@ -1177,7 +1948,7 @@ function renderFsHealthModalBody() {
     }
     const d = fsHealthData;
     const ageLine = d.age_seconds == null ? ''
-        : `<p class="fs-health-age">Result is ${d.age_seconds}s old (cron runs every 30 min)</p>`;
+        : `<p class="fs-health-age">Result is ${d.age_seconds}s old (cron runs every minute)</p>`;
     const statusBanner = d.status === 'ok'
         ? '<div class="fs-health-banner fs-health-banner-ok">All checks passed</div>'
         : `<div class="fs-health-banner fs-health-banner-fail">${escapeHtml(d.summary || 'Failed')}</div>`;
@@ -1192,12 +1963,36 @@ function renderFsHealthModalBody() {
                 <div class="fs-check-detail">${detail}</div>
             </div>`;
     }).join('');
+    // Pipeline section counts table.
+    const counts = d.pipeline_counts || {};
+    const countEntries = Object.entries(counts);
+    const totalOpen = countEntries
+        .filter(([s]) => !['Closed','Informational','Notification','Spam'].includes(s))
+        .reduce((sum, [, n]) => sum + n, 0);
+    const countRows = countEntries.map(([section, n]) => {
+        const terminal = ['Closed','Informational','Notification','Spam'].includes(section);
+        const cls = terminal ? 'fs-pipeline-terminal' : (n > 0 ? 'fs-pipeline-active' : 'fs-pipeline-empty');
+        return `<tr class="${cls}"><td>${escapeHtml(section)}</td><td class="fs-pipeline-count">${n}</td></tr>`;
+    }).join('');
+    const countsBlock = countRows ? `
+        <div class="fs-health-section-title">Pipeline (${totalOpen} active)</div>
+        <table class="fs-pipeline-table">${countRows}</table>
+    ` : '';
+
+    // Recent errors block.
+    const errors = (d.recent_errors || []);
+    const errorsBlock = errors.length ? `
+        <div class="fs-health-section-title fs-health-section-title-error">Recent errors (today)</div>
+        <div class="fs-errors-list">${errors.map(e => `<div class="fs-error-line">${escapeHtml(e)}</div>`).join('')}</div>
+    ` : '';
+
     body.innerHTML = `
         ${statusBanner}
         <p class="fs-health-tested-at">Tested at: <code>${escapeHtml(d.tested_at || 'never')}</code></p>
         ${ageLine}
         <div class="fs-check-list">${rows || '<p>No checks ran.</p>'}</div>
-        <p class="fs-health-source">Source: <code>${escapeHtml(d.file_path || '/shared/state/fs-connection-health.json')}</code> · written by <code>/shared/scripts/fs-connection-test.py</code></p>
+        ${countsBlock}
+        ${errorsBlock}
     `;
 }
 
@@ -1206,6 +2001,7 @@ function humanCheckName(name) {
         'api_reachable': 'FreshService API reachable',
         'sync_recent': 'Ticket sync ran recently',
         'events_poller_recent': 'Events poller ran recently',
+        'db_integrity': 'Ticket statuses intact',
     })[name] || name;
 }
 
@@ -1214,6 +2010,7 @@ function formatCheckDetail(name, c) {
         if (name === 'api_reachable') return `OK (${c.duration_ms}ms)`;
         if (name === 'sync_recent') return `Last sync: ${escapeHtml(c.last_synced)} (${c.age_seconds}s ago)`;
         if (name === 'events_poller_recent') return `Last run: ${escapeHtml(c.last_run)} (${c.age_seconds}s ago)`;
+        if (name === 'db_integrity') return `All ${c.total} tickets have a real status`;
         return 'OK';
     }
     return `<span class="fs-check-error">${escapeHtml(c.error || 'Unknown error')}</span>`;
@@ -1226,14 +2023,123 @@ function escapeHtml(s) {
     }[ch]));
 }
 
-loadFsHealth();
-setInterval(loadFsHealth, 5 * 60 * 1000);  // refresh every 5 min on the page (cron writes every 30 min)
+// Lightweight markdown renderer for task file content.
+// Handles: headings, bold/italic, inline code, links, checkboxes,
+// bullet lists, horizontal rules, blockquotes, and <sub>/<sup> HTML.
+function renderMarkdown(md) {
+    if (!md) return '';
 
-document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') {
-        closeAgentModal();
-        closeFsHealthModal();
+    // Strip YAML frontmatter (--- block at top).
+    md = md.replace(/^---\n[\s\S]*?\n---\n?/, '');
+    // Collapse HTML comments (template guidance) onto one line so they render
+    // as readable text instead of raw <!-- ... --> markup.
+    md = md.replace(/<!--([\s\S]*?)-->/g, (m, c) => '\n' + c.replace(/\s+/g, ' ').trim() + '\n');
+
+    const lines = md.split('\n');
+    const out = [];
+    let inList = false;
+    let inBlockquote = false;
+
+    const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+    const closeBQ   = () => { if (inBlockquote) { out.push('</blockquote>'); inBlockquote = false; } };
+
+    const inline = (s) => {
+        // Preserve <sub>, <sup>, <a href=...> tags.
+        s = s
+            // Bold+italic
+            .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
+            // Bold
+            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+            // Italic (asterisk)
+            .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>')
+            // Italic (underscore) — word boundaries only, so snake_case is safe
+            .replace(/(?<![A-Za-z0-9_])_(?!_)([^_\n]+?)_(?![A-Za-z0-9_])/g, '<em>$1</em>')
+            // Inline code
+            .replace(/`([^`]+)`/g, '<code class="md-code">$1</code>')
+            // Links [text](url)
+            .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" class="md-link">$1</a>');
+        return s;
+    };
+
+    const esc = (s) => s.replace(/&(?!amp;|lt;|gt;|quot;|#)/g, '&amp;').replace(/<(?!\/?(?:sub|sup|strong|em|a|code|br)\b)/g, '&lt;');
+
+    for (let i = 0; i < lines.length; i++) {
+        const raw = lines[i];
+        const line = raw.trimEnd();
+
+        // Horizontal rule
+        if (/^---+$/.test(line) || /^\*\*\*+$/.test(line)) {
+            closeList(); closeBQ();
+            out.push('<hr class="md-hr">');
+            continue;
+        }
+
+        // Headings
+        const hm = line.match(/^(#{1,4})\s+(.+)$/);
+        if (hm) {
+            closeList(); closeBQ();
+            const level = Math.min(hm[1].length, 4);
+            out.push(`<h${level} class="md-h${level}">${inline(esc(hm[2]))}</h${level}>`);
+            continue;
+        }
+
+        // Blockquote
+        if (/^>\s?/.test(line)) {
+            closeList();
+            if (!inBlockquote) { out.push('<blockquote class="md-blockquote">'); inBlockquote = true; }
+            out.push(`<p>${inline(esc(line.replace(/^>\s?/, '')))}</p>`);
+            continue;
+        } else {
+            closeBQ();
+        }
+
+        // Checklist item
+        const clm = line.match(/^(\s*)-\s*\[([ xX])\]\s+(.*)$/);
+        if (clm) {
+            if (!inList) { out.push('<ul class="md-list">'); inList = true; }
+            const checked = clm[2].trim().toLowerCase() === 'x';
+            const indent = clm[1] ? 'style="margin-left:' + (clm[1].length * 8) + 'px"' : '';
+            out.push(`<li class="md-check-item" ${indent}><span class="md-checkbox">${checked ? '☑' : '☐'}</span> ${inline(esc(clm[3]))}</li>`);
+            continue;
+        }
+
+        // Bullet list item
+        const bm = line.match(/^(\s*)[-*+]\s+(.*)$/);
+        if (bm) {
+            if (!inList) { out.push('<ul class="md-list">'); inList = true; }
+            const indent = bm[1] ? 'style="margin-left:' + (bm[1].length * 8) + 'px"' : '';
+            out.push(`<li class="md-list-item" ${indent}>${inline(esc(bm[2]))}</li>`);
+            continue;
+        }
+
+        // Blank line
+        if (line.trim() === '') {
+            closeList();
+            out.push('<div class="md-gap"></div>');
+            continue;
+        }
+
+        // Paragraph / plain line
+        closeList();
+        out.push(`<p class="md-p">${inline(esc(line))}</p>`);
     }
-});
-document.getElementById('agentModal')?.addEventListener('click', e => { if (e.target.id === 'agentModal') closeAgentModal(); });
-document.getElementById('fsHealthModal')?.addEventListener('click', e => { if (e.target.id === 'fsHealthModal') closeFsHealthModal(); });
+
+    closeList();
+    closeBQ();
+    return out.join('\n');
+}
+
+loadFsHealth();
+setInterval(loadFsHealth, 60 * 1000);  // refresh every 60s on the page (cron writes every minute)
+
+// Single Escape handler for the whole app: close ONLY the frontmost modal.
+// Capture phase + stopPropagation so no component-level handler also fires.
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && window.ModalStack.size > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        window.ModalStack.pop();
+    }
+}, true);
+// NOTE: backdrop-click-to-close is intentionally removed — clicking outside a
+// modal must never close it.

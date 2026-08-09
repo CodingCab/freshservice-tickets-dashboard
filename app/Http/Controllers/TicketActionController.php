@@ -25,15 +25,18 @@ use Throwable;
  */
 class TicketActionController extends Controller
 {
-    /**
-     * Sections where a draft can legitimately be rejected — i.e. one already
-     * exists or is being produced.
-     */
-    private const REJECTABLE_SECTIONS = [
-        'Ready to Send',
-        'Security Check',
-        'Reply Drafting',
-    ];
+    // Rejecting a draft is NOT gated by section — deliberately. "Reject and
+    // send back" is a human deciding the draft is wrong and asking for a new
+    // one with their feedback as a hard constraint. That judgement is the
+    // reviewer's to make from wherever the ticket happens to sit; the pipeline
+    // does not get to tell a human they may not ask for a better draft. The
+    // action is safe from any section: it records the feedback, marks the old
+    // draft stale, and routes to Reply Drafting — which is exactly the state a
+    // rejected draft should be in regardless of where it came from.
+    //
+    // Sending a reply IS gated (Ready to Send) — that one is irreversible and
+    // leaves our system. Rejecting is not. Only irreversible, outward-facing
+    // actions get a gate.
 
     private const SEND_REPLY_REQUIRED_SECTION = 'Ready to Send';
     private const SEND_REPLY_TARGET_SECTION = 'Replied — Awaiting Customer';
@@ -72,13 +75,28 @@ class TicketActionController extends Controller
         $ticketPath = $ticketFile->getPath();
         $ticketFilename = basename($ticketPath);
 
-        // Step 2 — section check.
+        // Step 2 — section check. The pipeline normally requires the ticket to
+        // have reached "Ready to Send" (i.e. passed Security Check). But the
+        // operator is the final authority on whether a reply goes out: when they
+        // explicitly confirm (`confirm_wrong_section`), we honour the send from
+        // any section and skip the gate. Block by default with a clear message,
+        // and tell the panel an override is available.
         $currentSection = $this->currentSection($ticketId);
-        if ($currentSection !== self::SEND_REPLY_REQUIRED_SECTION) {
+        $forceSection = filter_var($request->input('confirm_wrong_section', false), FILTER_VALIDATE_BOOLEAN);
+        if ($currentSection !== self::SEND_REPLY_REQUIRED_SECTION && !$forceSection) {
             return response()->json([
                 'error' => 'wrong_section',
                 'current' => $currentSection,
+                'can_override' => true,
+                'message' => "This ticket is in \"{$currentSection}\", not \"Ready to Send\" — it hasn't passed Security Check yet. "
+                    . "You can send it anyway if you're sure.",
             ], 409);
+        }
+        if ($currentSection !== self::SEND_REPLY_REQUIRED_SECTION && $forceSection) {
+            Log::info('sendReply: section gate overridden by operator', [
+                'ticket_id' => $ticketId,
+                'current_section' => $currentSection,
+            ]);
         }
 
         // Step 3 — locate the reply-draft sibling file.
@@ -138,6 +156,40 @@ class TicketActionController extends Controller
 
         $toEmail = $this->extractEmail($toRaw);
         $ccEmails = $this->extractEmails($ccRaw);
+
+        // CC override — the panel lets the operator edit / add CC recipients
+        // before sending. When the request carries a `cc` field we use it
+        // verbatim (a present-but-empty value means "send with no CC"); when
+        // the field is absent we keep the draft's recorded CC list. Each
+        // address is validated so a typo is reported back rather than silently
+        // dropped.
+        if ($request->has('cc')) {
+            $ccInput = $request->input('cc');
+            $ccInputRaw = is_array($ccInput) ? implode(', ', $ccInput) : (string) $ccInput;
+            $tokens = preg_split('/[,;\n]+/', $ccInputRaw) ?: [];
+            $invalid = [];
+            $ccEmails = [];
+            foreach ($tokens as $tok) {
+                $tok = trim($tok);
+                if ($tok === '') {
+                    continue;
+                }
+                $email = $this->extractEmail($tok);
+                if ($email === '') {
+                    $invalid[] = $tok;
+                } else {
+                    $ccEmails[] = $email;
+                }
+            }
+            if (!empty($invalid)) {
+                return response()->json([
+                    'error' => 'invalid_cc',
+                    'invalid' => $invalid,
+                    'message' => 'These CC addresses are not valid: ' . implode(', ', $invalid),
+                ], 422);
+            }
+            $ccEmails = array_values(array_unique($ccEmails));
+        }
 
         $meta = $ticketFile->getMetadata();
         $requesterRaw = $meta['Requester'] ?? '';
@@ -278,6 +330,17 @@ class TicketActionController extends Controller
             ]);
         }
 
+        // Step 9b — ingest the reply we just sent into `## Replies` now, so the
+        // panel shows it the moment the modal closes (best-effort).
+        try {
+            $this->syncRepliesFromFs($ticketId);
+        } catch (Throwable $e) {
+            Log::warning('Immediate FS reply-sync threw after send', [
+                'ticket_id' => $ticketId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
         // Step 10 — success response.
         return response()->json([
             'status' => 'sent',
@@ -391,7 +454,19 @@ class TicketActionController extends Controller
             return false;
         }
         $needle = 'Draft: ./' . $draftFilename;
-        return str_contains($timeline, 'Public reply sent') && str_contains($timeline, $needle);
+        // A genuine send is a SINGLE Timeline line that BOTH says "Public reply
+        // sent" AND names this draft file. Testing the two substrings across the
+        // whole timeline gives false positives on every follow-up reply: the
+        // drafter's "Draft reply produced (round N) … Draft: ./…-NN.md" line
+        // names the file, and a PRIOR draft's send already left a "Public reply
+        // sent" line elsewhere — together they wrongly read as "already sent",
+        // so the send is skipped and the customer never gets the reply.
+        foreach (preg_split("/\r\n|\n|\r/", $timeline) as $line) {
+            if (str_contains($line, 'Public reply sent') && str_contains($line, $needle)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -436,15 +511,10 @@ class TicketActionController extends Controller
         }
         $feedback = trim((string) $request->input('feedback'));
 
-        // 3. Verify the ticket is in a section that has (or is producing) a draft.
+        // 3. No section gate — see the note on SEND_REPLY_REQUIRED_SECTION above.
+        // The reviewer may reject from any section; we record where it came from
+        // so the Timeline shows the route the ticket actually took.
         $currentSection = $this->currentSection($ticketId);
-        if (!in_array($currentSection, self::REJECTABLE_SECTIONS, true)) {
-            return response()->json([
-                'error' => 'wrong_section',
-                'current' => $currentSection,
-                'message' => 'no draft to reject from this section',
-            ], 409);
-        }
 
         $timestamp = gmdate('Y-m-d H:i') . ' UTC';
 
@@ -470,8 +540,8 @@ class TicketActionController extends Controller
             ? rtrim(mb_substr($feedback, 0, 100)) . '...'
             : $feedback;
         $file->appendTimeline(
-            $timestamp . ': Draft rejected by reviewer. Feedback: ' . $truncated
-            . '. Moving back to Reply Drafting.'
+            $timestamp . ': Draft rejected by reviewer (from ## ' . ($currentSection ?: 'unknown')
+            . '). Feedback: ' . $truncated . '. Moving back to Reply Drafting.'
         );
 
         // 7. Move the ticket back to Reply Drafting via task-manager.py.
@@ -595,6 +665,17 @@ class TicketActionController extends Controller
             ));
         } catch (Throwable $e) {
             Log::warning('Failed to append Timeline entry after manual FS send', [
+                'ticket_id' => $ticketId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Ingest the reply into `## Replies` now rather than on the next
+        // 2-minute poll, so the panel shows it as soon as the modal closes.
+        try {
+            $this->syncRepliesFromFs($ticketId);
+        } catch (Throwable $e) {
+            Log::warning('Immediate FS reply-sync threw after manual send', [
                 'ticket_id' => $ticketId,
                 'error' => $e->getMessage(),
             ]);
@@ -1095,6 +1176,346 @@ class TicketActionController extends Controller
         ]);
     }
 
+    // ─── Auto-send arm / disarm ──────────────────────────────────────────────
+
+    /**
+     * POST `/api/tickets/{id}/arm-auto-send`
+     *
+     * Arm auto-send for the current reply draft. When the ticket next enters
+     * `## Ready to Send`, the ready-to-send handler checks this flag and
+     * triggers the send automatically if the draft filename still matches.
+     */
+    public function armAutoSend(Request $request, string $ticketId)
+    {
+        $numericId = ltrim($ticketId, 'Tt');
+        if ($numericId === '' || !ctype_digit($numericId)) {
+            return response()->json(['error' => 'invalid_ticket_id'], 422);
+        }
+
+        $draftFilename = $request->input('draft_filename');
+        if (!$draftFilename) {
+            return response()->json(['error' => 'draft_filename_required'], 422);
+        }
+
+        $dir = env('AUTO_SEND_ARMS_DIR', '/shared/state/auto-send-arms');
+        @mkdir($dir, 0775, true);
+        $path = $dir . '/T' . $numericId . '.json';
+        file_put_contents($path, json_encode([
+            'draft_filename' => $draftFilename,
+            'armed_at'       => gmdate('Y-m-d\TH:i:s\Z'),
+        ], JSON_PRETTY_PRINT));
+
+        return response()->json(['armed' => true, 'draft_filename' => $draftFilename]);
+    }
+
+    /**
+     * POST `/api/tickets/{id}/disarm-auto-send`
+     *
+     * Remove the auto-send arm for this ticket (if any).
+     */
+    public function disarmAutoSend(Request $request, string $ticketId)
+    {
+        $numericId = ltrim($ticketId, 'Tt');
+        if ($numericId === '' || !ctype_digit($numericId)) {
+            return response()->json(['error' => 'invalid_ticket_id'], 422);
+        }
+
+        $dir = env('AUTO_SEND_ARMS_DIR', '/shared/state/auto-send-arms');
+        $path = $dir . '/T' . $numericId . '.json';
+        if (file_exists($path)) {
+            @unlink($path);
+        }
+
+        return response()->json(['armed' => false]);
+    }
+
+    /**
+     * POST `/api/tickets/{id}/internal-note` — add an internal note that lands
+     * BOTH in FreshService (as a private note on the ticket) and in this
+     * dashboard (ingested into `## Replies` by the sync, so it shows in the
+     * conversation stream as an internal message).
+     *
+     * Unlike the local "operator note" scratchpad (a single mutable field, this
+     * dashboard only), an internal note is append-only and immutable — it mirrors
+     * exactly what a FreshService private note is. Reuses the same FS client and
+     * sync plumbing as `sendReply`, minus the section gate and reply-draft.
+     */
+    public function addInternalNote(Request $request, string $ticketId)
+    {
+        $numericId = ltrim($ticketId, 'Tt');
+        if ($numericId === '' || !ctype_digit($numericId)) {
+            return response()->json(['error' => 'invalid_ticket_id'], 422);
+        }
+
+        $note = trim((string) $request->input('note', ''));
+        if ($note === '') {
+            return response()->json([
+                'error'   => 'empty_note',
+                'message' => 'The internal note is empty.',
+            ], 422);
+        }
+
+        // Every ticket MUST have a pipeline file. Heal a missing one before
+        // recording anything against it (idempotent creator).
+        $ticketFile = TicketFile::find($ticketId);
+        if ($ticketFile === null) {
+            $this->ingestTicketFile($ticketId);
+            $ticketFile = TicketFile::find($ticketId);
+        }
+        if ($ticketFile === null) {
+            return response()->json([
+                'error'   => 'ticket_file_could_not_be_created',
+                'message' => 'The ticket has no pipeline file and it could not be created from FreshService (FS may be unreachable). Try again shortly.',
+            ], 502);
+        }
+
+        // Private notes carry no signature — this is internal, not a customer reply.
+        $htmlBody = ReplyHtmlBuilder::fromBodyMarkdown($note);
+        if (trim($htmlBody) === '') {
+            return response()->json([
+                'error'   => 'empty_note',
+                'message' => 'The internal note is empty after conversion.',
+            ], 422);
+        }
+
+        // POST to FreshService (one bounded retry, same policy as sendReply).
+        /** @var FreshServiceClient $client */
+        $client = app(FreshServiceClient::class);
+        $conversation = null;
+        $lastError = null;
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
+            try {
+                $conversation = $client->postPrivateNote((int) $numericId, $htmlBody);
+                break;
+            } catch (Throwable $e) {
+                $lastError = $e;
+                if ($attempt === 1) {
+                    sleep(self::FS_RETRY_DELAY_SECONDS);
+                }
+            }
+        }
+
+        if (!is_array($conversation) || !isset($conversation['id'])) {
+            $msg = $lastError !== null ? $lastError->getMessage() : 'no conversation id in response';
+            Log::error('FreshService private-note post failed', [
+                'ticket_id' => $ticketId,
+                'error'     => $msg,
+            ]);
+            return response()->json([
+                'error'   => 'fs_api_failed',
+                'message' => $msg,
+            ], 502);
+        }
+
+        $conversationId = (int) $conversation['id'];
+
+        // Timeline entry on the parent ticket (best-effort).
+        $timelineEntry = sprintf(
+            '%s UTC: Internal note added (FS private note #%d).',
+            gmdate('Y-m-d H:i'),
+            $conversationId
+        );
+        try {
+            $ticketFile->appendTimeline($timelineEntry);
+        } catch (Throwable $e) {
+            Log::warning('Failed to append Timeline entry after FS private note', [
+                'ticket_id' => $ticketId,
+                'error'     => $e->getMessage(),
+            ]);
+        }
+
+        // Pull the note back into `## Replies` now, so it shows in the panel's
+        // conversation stream the moment we return (best-effort).
+        try {
+            $this->syncRepliesFromFs($ticketId);
+        } catch (Throwable $e) {
+            Log::warning('Immediate FS reply-sync threw after private note', [
+                'ticket_id' => $ticketId,
+                'error'     => $e->getMessage(),
+            ]);
+        }
+
+        return response()->json([
+            'status'          => 'added',
+            'conversation_id' => $conversationId,
+        ], 200);
+    }
+
+    /**
+     * POST `/api/tickets/{id}/split` — split a second issue out of this ticket
+     * into a brand-new, standalone FreshService ticket.
+     *
+     * The operator supplies a new subject + body; everything else (requester,
+     * CC) is carried over from THIS ticket, so the new ticket looks exactly like
+     * a fresh customer submission. The original ticket is left untouched. Both
+     * tickets get a private note recording the split (audit trail). The new
+     * ticket is then ingested into the pipeline (## New) like any other.
+     */
+    public function split(Request $request, string $ticketId)
+    {
+        $numericId = ltrim($ticketId, 'Tt');
+        if ($numericId === '' || !ctype_digit($numericId)) {
+            return response()->json(['error' => 'invalid_ticket_id'], 422);
+        }
+
+        $subject = trim((string) $request->input('subject', ''));
+        $body    = trim((string) $request->input('body', ''));
+        if ($subject === '') {
+            return response()->json(['error' => 'empty_subject', 'message' => 'A subject for the new ticket is required.'], 422);
+        }
+        if ($body === '') {
+            return response()->json(['error' => 'empty_body', 'message' => 'A description for the new ticket is required.'], 422);
+        }
+
+        // Every ticket MUST have a pipeline file — heal a missing one first.
+        $ticketFile = TicketFile::find($ticketId);
+        if ($ticketFile === null) {
+            $this->ingestTicketFile($ticketId);
+            $ticketFile = TicketFile::find($ticketId);
+        }
+        if ($ticketFile === null) {
+            return response()->json([
+                'error'   => 'ticket_file_could_not_be_created',
+                'message' => 'The source ticket has no pipeline file and it could not be created from FreshService. Try again shortly.',
+            ], 502);
+        }
+
+        $meta = $ticketFile->getMetadata();
+        $requesterEmail = $this->extractEmail($meta['Requester'] ?? '');
+        if ($requesterEmail === '') {
+            return response()->json([
+                'error'   => 'no_requester',
+                'message' => "Can't split — the source ticket has no requester email to carry over.",
+            ], 422);
+        }
+        $ccEmails = $this->extractEmails($meta['CC'] ?? '');
+
+        $htmlDescription = ReplyHtmlBuilder::fromBodyMarkdown($body);
+        if (trim($htmlDescription) === '') {
+            return response()->json(['error' => 'empty_body', 'message' => 'The description is empty after conversion.'], 422);
+        }
+
+        // FreshService create-ticket payload. status=2 Open, priority=1 Low,
+        // source=2 Portal — a normal inbound ticket. cc_emails carried over.
+        $payload = [
+            'email'       => $requesterEmail,
+            'subject'     => $subject,
+            'description' => $htmlDescription,
+            'status'      => 2,
+            'priority'    => 1,
+            'source'      => 2,
+        ];
+        if (!empty($ccEmails)) {
+            $payload['cc_emails'] = array_values($ccEmails);
+        }
+
+        // Attachments the operator chose to carry over — resolve each selected
+        // filename to a real file inside THIS ticket's attachments dir (with a
+        // realpath-containment guard against traversal). Only existing, contained
+        // files are uploaded to the new ticket.
+        $selected = $request->input('attachments', []);
+        if (!is_array($selected)) {
+            $selected = [];
+        }
+        $attachmentPaths = [];
+        if (!empty($selected)) {
+            $ticketDir = dirname($ticketFile->getPath());
+            $datePrefix = preg_match('/^(\d{8})-/', basename($ticketFile->getPath()), $dm) ? $dm[1] : '';
+            $attDirs = [$ticketDir . '/T' . $numericId . '-attachments'];
+            if ($datePrefix !== '') {
+                $attDirs[] = $ticketDir . '/' . $datePrefix . '-T' . $numericId . '-attachments';
+            }
+            foreach ($selected as $name) {
+                $name = (string) $name;
+                if ($name === '' || str_contains($name, '/') || str_contains($name, '..')) {
+                    continue;
+                }
+                foreach ($attDirs as $dir) {
+                    $candidate = $dir . '/' . $name;
+                    if (!is_file($candidate)) {
+                        continue;
+                    }
+                    $real = realpath($candidate);
+                    $dirReal = realpath($dir);
+                    if ($real !== false && $dirReal !== false
+                        && str_starts_with($real, $dirReal . DIRECTORY_SEPARATOR)) {
+                        $attachmentPaths[$real] = true; // dedupe
+                        break;
+                    }
+                }
+            }
+        }
+        $attachmentPaths = array_keys($attachmentPaths);
+
+        /** @var FreshServiceClient $client */
+        $client = app(FreshServiceClient::class);
+        $created = null;
+        $lastError = null;
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
+            try {
+                $created = empty($attachmentPaths)
+                    ? $client->createTicket($payload)
+                    : $client->createTicketWithAttachments($payload, $attachmentPaths);
+                break;
+            } catch (Throwable $e) {
+                $lastError = $e;
+                if ($attempt === 1) {
+                    sleep(self::FS_RETRY_DELAY_SECONDS);
+                }
+            }
+        }
+        if (!is_array($created) || !isset($created['id'])) {
+            $msg = $lastError !== null ? $lastError->getMessage() : 'no ticket id in response';
+            Log::error('FreshService ticket split (create) failed', ['source' => $ticketId, 'error' => $msg]);
+            return response()->json(['error' => 'fs_api_failed', 'message' => $msg], 502);
+        }
+        $newId = (int) $created['id'];
+
+        // Cross-link notes on both sides (best-effort — the split already happened).
+        $origSubject = trim($meta['Subject'] ?? '');
+        if ($origSubject === '') {
+            $origSubject = trim($ticketFile->getSection('Subject'));
+        }
+        try {
+            $client->postPrivateNote($newId, ReplyHtmlBuilder::fromBodyMarkdown(
+                "Split from ticket #{$numericId}" . ($origSubject !== '' ? " ({$origSubject})" : '') . "."
+            ));
+        } catch (Throwable $e) {
+            Log::warning('split: note on new ticket failed', ['new' => $newId, 'error' => $e->getMessage()]);
+        }
+        try {
+            $client->postPrivateNote((int) $numericId, ReplyHtmlBuilder::fromBodyMarkdown(
+                "Split into new ticket #{$newId}: {$subject}."
+            ));
+        } catch (Throwable $e) {
+            Log::warning('split: note on source ticket failed', ['source' => $ticketId, 'error' => $e->getMessage()]);
+        }
+
+        // Ingest the new ticket into the pipeline (creates its file, lands in
+        // ## New) so it behaves like every other ticket from here on.
+        $this->ingestTicketFile('T' . $newId);
+
+        // Record the split on the source ticket's Timeline.
+        try {
+            $ticketFile->appendTimeline(gmdate('Y-m-d H:i') . " UTC: Split into new ticket #{$newId} — \"{$subject}\".");
+        } catch (Throwable $e) {
+            Log::warning('split: timeline append failed', ['source' => $ticketId, 'error' => $e->getMessage()]);
+        }
+
+        // Build the FS agent URL for the new ticket from the source's URL pattern.
+        $newFsUrl = '';
+        $srcUrl = $meta['Ticket URL'] ?? '';
+        if (preg_match('#^(https?://[^/]+/a/tickets/)\d+#', $srcUrl, $um)) {
+            $newFsUrl = $um[1] . $newId;
+        }
+
+        return response()->json([
+            'status'         => 'split',
+            'new_ticket_id'  => $newId,
+            'new_ticket_url' => $newFsUrl,
+        ], 200);
+    }
+
     /**
      * POST `/api/tickets/{id}/close` — backwards-compatible shorthand
      * for `setStatus` with `status = closed`.
@@ -1134,11 +1555,37 @@ class TicketActionController extends Controller
         }
         $targetCode = $statusMap[$targetName];
         $targetLabel = ucfirst($targetName);
+        $marker = $targetName === 'closed'
+            ? 'Ticket closed via dashboard'
+            : 'Ticket status changed via dashboard';
 
+        // Every ticket MUST have a pipeline file. A ticket can be visible on
+        // the dashboard (it lives in the FreshService DB) yet have no file yet
+        // — e.g. a GitHub-notification ticket whose OnTicketCreated ingestion
+        // never ran. Rather than block the action, create the file on demand
+        // via the same idempotent creator the poller uses, then retry.
         $file = TicketFile::find($ticketId);
         if ($file === null) {
-            return response()->json(['error' => 'ticket_file_not_found'], 404);
+            $this->ingestTicketFile($ticketId);
+            $file = TicketFile::find($ticketId);
         }
+        if ($file === null) {
+            // Still missing — FS was likely unreachable. Surface it so the
+            // operator knows the file could not be created (not a silent skip).
+            return response()->json([
+                'error'   => 'ticket_file_could_not_be_created',
+                'message' => 'The ticket has no pipeline file and it could not be created from FreshService (FS may be unreachable). Try again shortly.',
+            ], 502);
+        }
+
+        // Section the entry currently lives in — computed once up front so it
+        // is available both for the idempotent short-circuit and for the final
+        // response payload. (It was previously only assigned inside the
+        // idempotent branch, so the normal path threw an "undefined variable"
+        // error when building the response — AFTER the FS status change and
+        // section move had already happened, surfacing as a spurious HTTP 500
+        // on a ticket that was in fact closed correctly.)
+        $currentSection = $this->currentSection($ticketId);
 
         $reason = trim((string) $request->input('reason', ''));
         if (mb_strlen($reason) > 500) {
@@ -1188,7 +1635,6 @@ class TicketActionController extends Controller
             // (otherwise a "Send to Closed" click on a ticket that's
             // already Closed on FS would silently no-op while the entry
             // sat in some non-Closed section forever).
-            $currentSection = $this->currentSection($ticketId);
             if ($targetName === 'closed' && $currentSection !== 'Closed') {
                 try {
                     $this->moveToSection($file->getPath(), 'Closed');
@@ -1235,15 +1681,36 @@ class TicketActionController extends Controller
             ]);
         }
 
-        // Section move only applies to Closed — the other three target
-        // statuses are pure FS-side state changes and leave the pipeline
-        // section as-is.
+        // Section move on status change:
+        //  - Closing moves the entry to ## Closed.
+        //  - REOPENING (open/pending) a ticket that is currently parked in a
+        //    terminal/parked section pulls it back into the active pipeline
+        //    immediately (## Customer Replied), so the operator sees it reopen
+        //    right away instead of waiting for the 2-minute sync's reopen
+        //    reconciliation to do it. This mirrors that sync behaviour exactly.
+        //  - Resolved, or reopening a ticket already in a live section, leaves
+        //    the pipeline section as-is.
         $moveWarning = null;
+        $movedTo = null;
+        $terminalSections = ['Closed', 'Spam', 'Informational', 'Notification'];
         if ($targetName === 'closed') {
             try {
                 $this->moveToSection($file->getPath(), 'Closed');
+                $movedTo = 'Closed';
             } catch (Throwable $e) {
                 Log::warning('task-manager.py move failed after FS close', [
+                    'ticket_id' => $ticketId,
+                    'error' => $e->getMessage(),
+                ]);
+                $moveWarning = $e->getMessage();
+            }
+        } elseif (in_array($targetName, ['open', 'pending'], true)
+            && in_array($currentSection, $terminalSections, true)) {
+            try {
+                $this->moveToSection($file->getPath(), 'Customer Replied');
+                $movedTo = 'Customer Replied';
+            } catch (Throwable $e) {
+                Log::warning('task-manager.py move failed after FS reopen', [
                     'ticket_id' => $ticketId,
                     'error' => $e->getMessage(),
                 ]);
@@ -1256,6 +1723,7 @@ class TicketActionController extends Controller
             'target' => $targetName,
             'fs_status_code' => $targetCode,
             'from_section' => $currentSection,
+            'moved_to' => $movedTo,
         ];
         if ($moveWarning !== null) {
             $response['move_warning'] = $moveWarning;
@@ -1403,6 +1871,73 @@ class TicketActionController extends Controller
     /**
      * Shell out to task-manager.py to move the ticket entry between sections.
      */
+    /**
+     * Pull the ticket's conversations from FreshService into the ticket file
+     * right now, instead of waiting for the 2-minute poller.
+     *
+     * `## Replies` has exactly one writer — the FS sync. We do NOT append the
+     * reply we just sent ourselves: dual-writing the same block would risk
+     * duplicates (the sync dedups on timestamp-minute + from-email, so a
+     * send at 14:51:59 landing in FS as 14:52 would slip through as a second
+     * copy) and would leave two places rendering the same format. Instead we
+     * just run the one writer immediately, so a reply is in the panel by the
+     * time the modal closes rather than up to 2 minutes later.
+     *
+     * Strictly best-effort: the reply has ALREADY left our system by the time
+     * this runs, so a sync failure must never turn a successful send into an
+     * error response. On failure the 2-minute poller still picks it up.
+     */
+    private function syncRepliesFromFs(string $ticketId): void
+    {
+        $process = new Process(['python3', '/shared/scripts/freshservice_ticket_sync.py', $ticketId]);
+        $process->setTimeout(25.0);
+        $process->run();
+
+        if (!$process->isSuccessful()) {
+            Log::warning('Immediate FS reply-sync after send failed; the 2-minute poller will still ingest it', [
+                'ticket_id' => $ticketId,
+                'stderr' => $process->getErrorOutput(),
+            ]);
+        }
+    }
+
+    /**
+     * Create the pipeline file for a ticket that exists on FreshService but
+     * has no file yet. Every ticket MUST have a file — a ticket without one is
+     * a gap to be healed, never a reason to skip an action. The creator script
+     * is idempotent: it fetches fresh FS data + attachments and adds the ticket
+     * to TICKETS-TASK-LIST § New so the pipeline picks it up.
+     */
+    private function ingestTicketFile(string $ticketId): void
+    {
+        $numericId = ltrim($ticketId, 'Tt');
+        if (!ctype_digit($numericId)) {
+            return;
+        }
+        $script = env('TICKET_CREATE_SCRIPT', '/shared/scripts/freshservice_ticket_create.py');
+        if (!is_readable($script)) {
+            Log::warning('ingestTicketFile: creator script not readable', ['script' => $script]);
+            return;
+        }
+        try {
+            $process = new Process(['python3', $script, $numericId]);
+            $process->setTimeout(90.0);
+            $process->run();
+            if (!$process->isSuccessful()) {
+                Log::warning('ingestTicketFile: creator exited non-zero', [
+                    'ticket_id' => $ticketId,
+                    'exit'      => $process->getExitCode(),
+                    'err'       => trim($process->getErrorOutput() ?: $process->getOutput()),
+                ]);
+            }
+        } catch (Throwable $e) {
+            Log::warning('ingestTicketFile: creator failed to run', [
+                'ticket_id' => $ticketId,
+                'error'     => $e->getMessage(),
+            ]);
+        }
+    }
+
     private function moveToSection(string $ticketFilePath, string $section): void
     {
         $tasksRoot = $this->tasksRoot();

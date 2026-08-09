@@ -1,5 +1,5 @@
 <template>
-    <div v-if="isOpen" class="rdm-overlay" @click.self="cancel">
+    <div v-if="isOpen" class="rdm-overlay">
         <div class="rdm-dialog" role="dialog" aria-modal="true" aria-label="Confirm send reply">
             <header class="rdm-header">
                 <h2 class="rdm-title">Reply draft &mdash; {{ ticketId }}</h2>
@@ -28,9 +28,18 @@
                         <template v-if="draft.created_at">
                             <dt>Created</dt><dd>{{ formattedCreatedAt }}</dd>
                         </template>
-                        <template v-if="draft.cc && !ccIsEmpty">
-                            <dt>CC</dt><dd>{{ draft.cc }}</dd>
-                        </template>
+                        <dt>CC</dt>
+                        <dd>
+                            <input
+                                type="text"
+                                class="rdm-cc-input"
+                                v-model="editCc"
+                                :disabled="sending || !!sendSuccess || alreadySent"
+                                placeholder="Add CC recipients, comma-separated"
+                                spellcheck="false"
+                                autocomplete="off"
+                            />
+                        </dd>
                         <template v-if="draft.subject">
                             <dt>Subject</dt><dd>{{ draft.subject }}</dd>
                         </template>
@@ -49,7 +58,23 @@
                     <p class="rdm-sig-note">The standard ShipTown signature (logo · ship.town · tagline) is appended automatically when sent — no need to add it here.</p>
                 </template>
 
+                <div v-if="autoSendArmed" class="rdm-armed-banner">
+                    ⚡ Auto-send is armed — this reply will send automatically the moment it passes Security Check and reaches “Ready to Send”.
+                    <button type="button" class="rdm-armed-cancel" :disabled="arming" @click="disarmAutoSend">Cancel auto-send</button>
+                </div>
                 <div v-if="sendError" class="rdm-send-error">{{ sendError }}</div>
+                <!-- Blocked only because the ticket hasn't passed Security Check
+                     yet. The operator is the final authority: offer BOTH an
+                     immediate "send anyway" override AND arm-after-security. -->
+                <div v-if="canForceSend && !sendSuccess" class="rdm-arm-offer">
+                    <button type="button" class="btn btn-warning" :disabled="sending || arming" @click="forceSend">
+                        {{ sending ? 'Sending…' : '⚠️ Send anyway — I confirm this goes out now' }}
+                    </button>
+                    <button v-if="!autoSendArmed" type="button" class="btn btn-arm" :disabled="arming || sending" @click="armAutoSend">
+                        {{ arming ? 'Arming…' : '⚡ Or: send automatically once it passes Security Check' }}
+                    </button>
+                    <span v-if="armError" class="rdm-arm-error">{{ armError }}</span>
+                </div>
                 <div v-if="sendSuccess" class="rdm-send-success">
                     Sent. FS conversation #{{ sendSuccess.conversation_id }}.
                 </div>
@@ -90,6 +115,7 @@
 </template>
 
 <script>
+import modalStackMixin from '../modalStackMixin';
 /**
  * ReplyDraftModal — confirmation modal for the "Send draft" inline action.
  *
@@ -110,22 +136,28 @@
  *      error inline.
  */
 export default {
+    mixins: [modalStackMixin],
     name: 'ReplyDraftModal',
     props: {
         ticketId: { type: String, default: '' },
         isOpen: { type: Boolean, default: false },
     },
-    emits: ['close', 'sent', 'reject-requested'],
+    emits: ['close', 'sent', 'reject-requested', 'armed'],
     data() {
         return {
             loading: false,
             loadError: '',
             draft: null,
             editBody: '',
+            editCc: '',
             sending: false,
             sendError: '',
             sendSuccess: null,
             canOverrideMismatch: false,
+            canForceSend: false,
+            autoSendArmed: false,
+            arming: false,
+            armError: '',
         };
     },
     computed: {
@@ -140,6 +172,10 @@ export default {
             const cc = (this.draft && this.draft.cc) || '';
             const norm = cc.trim().toLowerCase();
             return norm === '' || norm === '—' || norm === '_(none)_' || norm === '(none)';
+        },
+        originalCc() {
+            if (!this.draft) return '';
+            return this.ccIsEmpty ? '' : String(this.draft.cc || '').trim();
         },
         formattedCreatedAt() {
             const iso = this.draft && this.draft.created_at ? this.draft.created_at : '';
@@ -170,10 +206,15 @@ export default {
             this.loadError = '';
             this.draft = null;
             this.editBody = '';
+            this.editCc = '';
             this.sendError = '';
             this.sendSuccess = null;
             this.sending = false;
             this.canOverrideMismatch = false;
+            this.canForceSend = false;
+            this.autoSendArmed = false;
+            this.arming = false;
+            this.armError = '';
         },
         async loadDraft() {
             this.loading = true;
@@ -185,6 +226,8 @@ export default {
                 const data = await resp.json();
                 this.draft = data && data.reply_draft ? data.reply_draft : null;
                 this.editBody = this.draft && this.draft.body_markdown ? this.draft.body_markdown : '';
+                this.editCc = this.originalCc;
+                this.autoSendArmed = !!(this.draft && this.draft.auto_send_armed);
                 if (!this.draft) {
                     this.loadError = 'no draft for this ticket';
                 }
@@ -207,14 +250,20 @@ export default {
             const code = body && body.error;
             const current = body && body.current;
             if (code === 'wrong_section') {
+                if (body && body.message) return body.message;
                 return current
-                    ? `Can't send yet — this ticket is in "${current}", not "Ready to Send". It still has to pass Security Check and reach Ready to Send before it can be sent.`
-                    : `Can't send — the ticket isn't in "Ready to Send" yet (it must pass Security Check first).`;
+                    ? `This ticket is in "${current}", not "Ready to Send" — it hasn't passed Security Check yet. You can send it anyway if you're sure.`
+                    : `The ticket isn't in "Ready to Send" yet (it hasn't passed Security Check). You can send it anyway if you're sure.`;
             }
             if (code === 'ticket_file_not_found') return "Can't send — the ticket file wasn't found.";
             if (code === 'bad_filename') return "Can't send — the ticket filename is malformed.";
             if (code === 'draft_not_found' || code === 'no_draft' || code === 'reply_draft_not_found') return "Can't send — no reply draft was found for this ticket.";
             if (code === 'already_sent') return 'This reply has already been sent.';
+            if (code === 'invalid_cc') {
+                return (body && body.message)
+                    ? body.message
+                    : 'One or more CC addresses are not valid email addresses.';
+            }
             if (code === 'requester_mismatch') {
                 return (body && body.message)
                     ? body.message
@@ -223,7 +272,7 @@ export default {
             if (code) return code + (body && body.message ? ': ' + body.message : '');
             return 'Send failed (HTTP ' + status + ').';
         },
-        async send({ overrideMismatch = false } = {}) {
+        async send({ overrideMismatch = false, forceSection = false } = {}) {
             this.sending = true;
             this.sendError = '';
             try {
@@ -231,8 +280,11 @@ export default {
                 // otherwise send {} so the backend uses the original draft file
                 // verbatim (no rendering drift for the untouched case).
                 const original = (this.draft && this.draft.body_markdown ? this.draft.body_markdown : '').trim();
-                const payload = this.editBody.trim() !== original ? { body: this.editBody } : {};
+                const payload = {};
+                if (this.editBody.trim() !== original) payload.body = this.editBody;
+                if (this.editCc.trim() !== this.originalCc) payload.cc = this.editCc.trim();
                 if (overrideMismatch) payload.confirm_requester_mismatch = true;
+                if (forceSection) payload.confirm_wrong_section = true;
                 const resp = await fetch(
                     '/api/tickets/' + encodeURIComponent(this.ticketId) + '/send-reply',
                     {
@@ -246,6 +298,9 @@ export default {
                     this.sendError = this.friendlySendError(body, resp.status);
                     // Offer an explicit override path for a recipient mismatch.
                     this.canOverrideMismatch = body && body.error === 'requester_mismatch' && body.can_override === true;
+                    // Blocked only because it hasn't passed Security Check yet →
+                    // the operator can force-send now, or arm auto-send for later.
+                    this.canForceSend = body && body.error === 'wrong_section';
                     return;
                 }
                 this.sendSuccess = body;
@@ -259,6 +314,60 @@ export default {
         sendAnyway() {
             this.canOverrideMismatch = false;
             this.send({ overrideMismatch: true });
+        },
+        forceSend() {
+            // Operator confirmed the send should go out despite the ticket not
+            // having reached "Ready to Send". Carry the requester-mismatch
+            // override too if that was also flagged, so one click resolves both.
+            const overrideMismatch = this.canOverrideMismatch;
+            this.canForceSend = false;
+            this.sendError = '';
+            this.send({ forceSection: true, overrideMismatch });
+        },
+        async armAutoSend() {
+            if (!this.draft || !this.draft.filename) {
+                this.armError = 'No draft to arm.';
+                return;
+            }
+            this.arming = true;
+            this.armError = '';
+            try {
+                const resp = await fetch(
+                    '/api/tickets/' + encodeURIComponent(this.ticketId) + '/arm-auto-send',
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                        body: JSON.stringify({ draft_filename: this.draft.filename }),
+                    }
+                );
+                const body = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error((body && (body.message || body.error)) || ('HTTP ' + resp.status));
+                this.autoSendArmed = true;
+                this.canForceSend = false;
+                this.sendError = '';
+                this.$emit('armed', { armed: true });
+            } catch (e) {
+                this.armError = 'Could not arm auto-send: ' + (e.message || e);
+            } finally {
+                this.arming = false;
+            }
+        },
+        async disarmAutoSend() {
+            this.arming = true;
+            this.armError = '';
+            try {
+                const resp = await fetch(
+                    '/api/tickets/' + encodeURIComponent(this.ticketId) + '/disarm-auto-send',
+                    { method: 'POST', headers: { 'Accept': 'application/json' } }
+                );
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                this.autoSendArmed = false;
+                this.$emit('armed', { armed: false });
+            } catch (e) {
+                this.armError = 'Could not cancel auto-send: ' + (e.message || e);
+            } finally {
+                this.arming = false;
+            }
         },
     },
 };
@@ -340,6 +449,20 @@ export default {
 }
 .rdm-meta dt { color: #c9d1d9; font-weight: 700; }
 .rdm-meta dd { margin: 0; color: #8b949e; word-break: break-word; }
+.rdm-cc-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-family: inherit;
+    font-size: 12.5px;
+    color: #c9d1d9;
+}
+.rdm-cc-input:focus { outline: none; border-color: #1f6feb; }
+.rdm-cc-input:disabled { opacity: 0.6; }
+.rdm-cc-input::placeholder { color: #6e7681; }
 
 .rdm-preview-label {
     font-size: 12px;
@@ -402,6 +525,46 @@ export default {
     font-size: 13px;
     font-weight: 600;
 }
+
+.rdm-armed-banner {
+    margin: 0 0 12px;
+    padding: 9px 12px;
+    border: 1px solid #2ea04355;
+    background: #0d1f17;
+    color: #56d364;
+    border-radius: 6px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.rdm-armed-cancel {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid #2ea04366;
+    color: #56d364;
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.rdm-armed-cancel:hover:not(:disabled) { background: #16311f; }
+.rdm-armed-cancel:disabled { opacity: 0.5; cursor: default; }
+.rdm-arm-offer {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.btn-arm {
+    background: #14332a;
+    color: #56d364;
+    border-color: #2ea04366;
+}
+.btn-arm:hover:not(:disabled) { background: #1a4636; border-color: #2ea043; }
+.rdm-arm-error { color: #ffa198; font-size: 12.5px; }
 
 .rdm-footer {
     display: flex;

@@ -26,3 +26,9 @@ test-results/
 
 # AI Sessions live snapshots (runtime data)
 storage/ai-sessions/
+
+# Python bytecode from the bin/ helper scripts
+bin/__pycache__/
+
+# Ticket labels store (runtime data)
+storage/tickets-labels.json

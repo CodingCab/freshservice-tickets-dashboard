@@ -40,6 +40,7 @@ class TicketsController extends Controller
     {
         $data = json_decode(file_get_contents(self::dbPath()), true);
         $sectionMap = $this->loadPipelineSectionMap();
+        $labelAssignments = \App\Services\LabelStore::assignments();
 
         // Ensure every ticket has an `internal` sub-object
         if (isset($data['tickets'])) {
@@ -52,7 +53,11 @@ class TicketsController extends Controller
                     'next_action' => null,
                     'summary' => null,
                     'pipeline_section' => null,
+                    'label_ids' => [],
                 ], $ticket['internal']);
+
+                // Shared labels assigned to this ticket (see LabelStore).
+                $ticket['internal']['label_ids'] = $labelAssignments[(string) $id] ?? [];
 
                 // Resolve pipeline section from TICKETS-TASK-LIST.md (e.g.
                 // "Reply Drafting", "Security Check", "Ready to Send",
@@ -197,7 +202,70 @@ class TicketsController extends Controller
             $data['status'] = 'failed';
             $data['summary'] = "Health-check result is stale ({$age}s old). Cron job may have stopped.";
         }
+
+        // Ticket pipeline section counts — quick operational snapshot.
+        $data['pipeline_counts'] = $this->ticketPipelineCounts();
+
+        // Recent sync errors from the cron log.
+        $data['recent_errors'] = $this->recentSyncErrors();
+
         return response()->json($data);
+    }
+
+    /**
+     * Count tickets per section in TICKETS-TASK-LIST.md.
+     *
+     * @return array<string, int>
+     */
+    private function ticketPipelineCounts(): array
+    {
+        $listPath = env('TASK_LISTS_DIR', '/shared/task-lists') . '/TICKETS-TASK-LIST.md';
+        if (!is_readable($listPath)) {
+            return [];
+        }
+        $counts = [];
+        $section = '';
+        foreach (explode("\n", file_get_contents($listPath)) as $line) {
+            if (preg_match('/^##\s+(.+?)\s*$/', $line, $m)) {
+                $section = trim($m[1]);
+                continue;
+            }
+            if ($section !== '' && preg_match('/^-\s*\[/', $line)) {
+                $counts[$section] = ($counts[$section] ?? 0) + 1;
+            }
+        }
+        return $counts;
+    }
+
+    /**
+     * Pull last few error lines from today's sync log, if any.
+     *
+     * @return list<string>
+     */
+    private function recentSyncErrors(): array
+    {
+        $logDir = '/shared/app-files/logs';
+        $today = gmdate('Y-m-d');
+        $errors = [];
+        // Check a handful of relevant log files written by cron scripts.
+        $candidates = [
+            $logDir . '/freshservice-sync-' . $today . '.log',
+            $logDir . '/freshservice-events-' . $today . '.log',
+            $logDir . '/reopen-tickets-freshservice-has-open/' . $today . '.log',
+        ];
+        foreach ($candidates as $file) {
+            if (!is_readable($file)) {
+                continue;
+            }
+            $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+            foreach (array_slice($lines, -100) as $line) {
+                if (stripos($line, 'error') !== false || stripos($line, 'failed') !== false) {
+                    $errors[] = basename($file) . ': ' . $line;
+                }
+            }
+        }
+        // Return at most 10 most recent errors.
+        return array_slice($errors, -10);
     }
 
     /**
@@ -205,6 +273,16 @@ class TicketsController extends Controller
      */
     public function agents(Request $request)
     {
+        // This endpoint builds the full in-range history as one array and
+        // json_encodes it; on high-volume days the 24h window alone is ~50MB of
+        // JSON / ~210MB peak, which blows php.ini's 128M limit and returns an
+        // empty 500 body ("Unexpected end of JSON input"). Measured real peak is
+        // ~456MB (186MB response) for a busy 24h window, so raise well above that
+        // at runtime — it applies immediately (the .user.ini backstop only lands
+        // after FPM's 300s ini cache TTL). Box has 62G RAM and FPM caps at 5
+        // workers, so 1G/request is safe. Durable fix: cap/paginate this response.
+        @ini_set('memory_limit', '1024M');
+
         $queueDir = '/shared/agents/queue';
         // Optional ISO-8601 UTC bounds. No params = full history, no caps —
         // how much is visible is the caller's choice, not the server's.
@@ -213,8 +291,22 @@ class TicketsController extends Controller
 
         $timeOf = fn($t) => $t['created_at'] ?? $t['failed_at'] ?? $t['started_at'] ?? '';
 
+        // Range applies to finished work only; running/pending are "now" and are
+        // always kept. This is applied AS each file is read (not after loading
+        // everything) so out-of-range archive entries are never accumulated —
+        // the archive can be >100MB, and loading a whole overlapping month into
+        // memory before filtering exhausts PHP's memory limit, which makes the
+        // endpoint return an empty 500 body ("Unexpected end of JSON input").
+        $inRange = function ($task) use ($since, $until, $timeOf) {
+            if (in_array($task['status'] ?? '', ['running', 'pending'], true)) return true;
+            $ts = $timeOf($task);
+            if ($since && strcmp($ts, $since) < 0) return false;
+            if ($until && strcmp($ts, $until) > 0) return false;
+            return true;
+        };
+
         $tasks = [];
-        $readDir = function (string $dir, ?string $status) use (&$tasks) {
+        $readDir = function (string $dir, ?string $status) use (&$tasks, $inRange) {
             if (!is_dir($dir)) return;
             foreach (glob($dir . '/*.json') as $file) {
                 if (!is_readable($file)) continue;
@@ -230,6 +322,7 @@ class TicketsController extends Controller
                     elseif (!empty($task['completed_at'])) $task['status'] = 'completed';
                     elseif (!in_array($task['status'] ?? '', ['completed', 'failed', 'cancelled'], true)) $task['status'] = 'completed';
                 }
+                if (!$inRange($task)) continue;
                 $tasks[] = $task;
             }
         };
@@ -248,18 +341,6 @@ class TicketsController extends Controller
             if ($since && strcmp($month . '-31T23:59:59Z', $since) < 0) continue;
             if ($until && strcmp($month . '-01T00:00:00Z', $until) > 0) continue;
             $readDir($monthDir, null);
-        }
-
-        // Range applies to finished work; running/pending are "now" and always
-        // included so the live picture is never filtered away.
-        if ($since || $until) {
-            $tasks = array_values(array_filter($tasks, function ($t) use ($since, $until, $timeOf) {
-                if (in_array($t['status'], ['running', 'pending'], true)) return true;
-                $ts = $timeOf($t);
-                if ($since && strcmp($ts, $since) < 0) return false;
-                if ($until && strcmp($ts, $until) > 0) return false;
-                return true;
-            }));
         }
 
         // One flat list, newest first — no status grouping.
@@ -484,6 +565,105 @@ class TicketsController extends Controller
     }
 
     /**
+     * Serve the raw markdown content of a task related to this ticket — i.e. a
+     * task on another list (Coding, Consult, …) that references the ticket and
+     * is rendered in the panel's `## Related tasks` block.
+     *
+     * Unlike subtasks, related tasks live outside the ticket's own directory,
+     * so this endpoint does NOT accept a caller-supplied path. It re-derives the
+     * vetted related-task list server-side (findRelatedTasks), matches on the
+     * requested task id, and returns only that file — so only files the panel
+     * would already surface as related are ever readable.
+     *
+     * Returns JSON `{ filename, content }` on success.
+     */
+    public function relatedTask(string $ticketId, string $taskId)
+    {
+        $related = $this->findRelatedTasks($ticketId);
+        $match = null;
+        foreach ($related as $r) {
+            if (($r['task_id'] ?? '') === $taskId) {
+                $match = $r;
+                break;
+            }
+        }
+        if ($match === null) {
+            return response()->json(['error' => 'related_task_not_found'], 404);
+        }
+
+        $resolved = $this->resolveTaskFilePath((string) ($match['path'] ?? ''));
+        if ($resolved === null) {
+            return response()->json(['error' => 'related_task_file_not_found', 'path' => $match['path'] ?? ''], 404);
+        }
+
+        $content = @file_get_contents($resolved);
+        if ($content === false) {
+            return response()->json(['error' => 'read_failed'], 500);
+        }
+
+        return response()->json([
+            'filename' => $match['path'] ?? basename($resolved),
+            'content'  => $content,
+        ]);
+    }
+
+    /**
+     * Resolve a related-task list-entry path to a readable absolute file.
+     *
+     * List entries link the file relative to different bases per list (some to
+     * /shared/task-lists, some to its parent /shared), or absolutely — so try
+     * each candidate. The result is confined via realpath to the /shared tree
+     * and must be a .md file: defence in depth on top of findRelatedTasks having
+     * already vetted the entry as related to this ticket. Returns null if none
+     * resolves safely.
+     *
+     * `$relativeTo` adds one more base to try FIRST: a subtask is linked from
+     * the ticket file as `./{name}.md`, i.e. relative to the TICKET's own
+     * directory, which matches neither list base. Without it such a link never
+     * resolves, and a subtask that cannot be resolved cannot be recognised as
+     * already-shown — so it surfaces a second time under "Related tasks".
+     */
+    private function resolveTaskFilePath(string $entryPath, ?string $relativeTo = null): ?string
+    {
+        if ($entryPath === '') {
+            return null;
+        }
+        $dir  = env('TASK_LISTS_DIR', '/shared/task-lists');
+        $base = dirname($dir); // /shared
+        $baseReal = realpath($base);
+        if ($baseReal === false) {
+            return null;
+        }
+        if (str_starts_with($entryPath, '/')) {
+            $candidates = [$entryPath];
+        } else {
+            $candidates = [];
+            if ($relativeTo !== null && $relativeTo !== '') {
+                $candidates[] = rtrim($relativeTo, '/') . '/' . $entryPath;
+            }
+            $candidates[] = $dir . '/' . $entryPath;
+            $candidates[] = $base . '/' . $entryPath;
+        }
+        foreach ($candidates as $p) {
+            if (!is_file($p)) {
+                continue;
+            }
+            $real = realpath($p);
+            if ($real === false) {
+                continue;
+            }
+            if (!str_starts_with($real, $baseReal . DIRECTORY_SEPARATOR)) {
+                continue;
+            }
+            if (!str_ends_with(strtolower($real), '.md')) {
+                continue;
+            }
+            return $real;
+        }
+        return null;
+    }
+
+    /**
      * Ingest a ticket into the pipeline on demand by running the same
      * deterministic creator the OnTicketCreated poller uses. Idempotent
      * (no-op if the file already exists). Best-effort: logs and swallows
@@ -550,8 +730,19 @@ class TicketsController extends Controller
         }
 
         $replies = $file->getReplies();
-        $subtasks = $this->enrichSubtasks($file->getSubtasks(), dirname($file->getPath()));
-        $relatedTasks = $this->findRelatedTasks($ticketId);
+        $rawSubtasks = $file->getSubtasks();
+        $subtasks = $this->enrichSubtasks($rawSubtasks, dirname($file->getPath()));
+        // Build a set of resolved subtask paths so findRelatedTasks can skip them —
+        // a subtask file must not appear in both panels simultaneously.
+        $subtaskPaths = [];
+        $ticketDir = dirname($file->getPath());
+        foreach ($rawSubtasks as $s) {
+            $resolved = $this->resolveTaskFilePath($s['path'] ?? '', $ticketDir);
+            if ($resolved !== null) {
+                $subtaskPaths[$resolved] = true;
+            }
+        }
+        $relatedTasks = $this->findRelatedTasks($ticketId, $subtaskPaths);
         $pipelineSection = $this->loadPipelineSectionMap()[ltrim($ticketId, 'Tt')] ?? null;
         $bodyHtml = null;
 
@@ -603,6 +794,12 @@ class TicketsController extends Controller
             'subject'      => $file->getSection('Subject'),
             'body'         => $file->getSection('Body'),
             'body_html'    => $bodyHtml,
+            // Files the customer sent with the opening message. Inline images
+            // are already rendered inside the body, but a real file attachment
+            // (a PDF, a spreadsheet) had no representation at all until this
+            // was surfaced — it sat on disk, downloaded and scanned, with
+            // nothing in the panel pointing at it.
+            'attachments'  => $file->getAttachments(),
             'replies'      => $replies,
             'subtasks'     => $subtasks,
             'related_tasks' => $relatedTasks,
@@ -657,7 +854,7 @@ class TicketsController extends Controller
      *
      * @return array<int, array<string, mixed>>
      */
-    private function findRelatedTasks(string $ticketId): array
+    private function findRelatedTasks(string $ticketId, array $subtaskPaths = []): array
     {
         $numeric = ltrim($ticketId, 'Tt');
         if ($numeric === '' || !ctype_digit($numeric)) {
@@ -670,6 +867,7 @@ class TicketsController extends Controller
         $needles = ['INC-' . $numeric, 'tickets/' . $numeric];
 
         $results = [];
+        $seenFiles = [];
         foreach (glob($dir . '/*-TASK-LIST.md') ?: [] as $listPath) {
             $contents = @file_get_contents($listPath);
             if (!is_string($contents) || $contents === '') {
@@ -699,7 +897,17 @@ class TicketsController extends Controller
                 if (preg_match('/T' . $numeric . '-sub-/', $taskId) || preg_match('/T' . $numeric . '-sub-/', $path)) {
                     continue;
                 }
-                if (preg_match('/T' . $numeric . '-fs-ticket/', $path)) {
+                // A ticket is not a task. Ticket files (`*-T<id>-fs-ticket.md`)
+                // are this panel's own subject matter, so surfacing one under
+                // "Related tasks" renders a ticket inside a ticket.
+                //
+                // This used to skip only THIS ticket's own file. But any other
+                // ticket gets pulled in as soon as its body mentions this
+                // ticket's number — e.g. "Same incident as INC-67311" in an
+                // unrelated ticket's analysis. That is a cross-reference
+                // between two tickets, not a task anyone has to do, and it
+                // belongs nowhere near this list.
+                if (preg_match('/-T\d+-fs-ticket/', $path)) {
                     continue;
                 }
 
@@ -719,6 +927,30 @@ class TicketsController extends Controller
                 }
                 if (!$hit) {
                     continue;
+                }
+
+                // A task file is attached to a ticket at its HOME — the one list
+                // where it is really processed. The task file's frontmatter
+                // `home:` (maintained automatically by task-manager on add/move)
+                // names that list. Every appearance of the same file on any
+                // OTHER list is an informational pointer and is skipped here, so
+                // the panel shows the task once, at its real destination.
+                $home = $this->taskFileHome($path);
+                if ($home !== null && $home !== $listName) {
+                    continue;
+                }
+                // Safety dedup by resolved file (covers legacy files with no
+                // `home` stamp yet that happen to sit on two lists).
+                $canon = $this->resolveTaskFilePath($path);
+                if ($canon !== null) {
+                    if (isset($seenFiles[$canon])) {
+                        continue;
+                    }
+                    $seenFiles[$canon] = true;
+                    // Already shown in the Subtasks panel — skip from Related.
+                    if (isset($subtaskPaths[$canon])) {
+                        continue;
+                    }
                 }
 
                 // Extract label (`**LABEL**`) and title.
@@ -752,6 +984,25 @@ class TicketsController extends Controller
             }
         }
         return $results;
+    }
+
+    /**
+     * The task's HOME list — the one list where it is really processed, read
+     * from the task file's frontmatter `home:` (list filename stem, e.g.
+     * `CODING-TASK-LIST`). Maintained automatically by task-manager on add/move.
+     * Returns null when the file is missing or carries no `home` stamp (legacy).
+     */
+    private function taskFileHome(string $entryPath): ?string
+    {
+        $path = $this->resolveTaskFilePath($entryPath);
+        if ($path === null) {
+            return null;
+        }
+        $head = @file_get_contents($path, false, null, 0, 4096);
+        if (!is_string($head) || $head === '') {
+            return null;
+        }
+        return preg_match('/^home:\s*(.+?)\s*$/mi', $head, $m) ? trim($m[1]) : null;
     }
 
     /**
@@ -980,6 +1231,15 @@ class TicketsController extends Controller
             }
         }
 
+        // Check if auto-send is armed for this draft filename.
+        $autoSendArmed = false;
+        $armsDir = env('AUTO_SEND_ARMS_DIR', '/shared/state/auto-send-arms');
+        $armFile = $armsDir . '/T' . $numericId . '.json';
+        if (is_file($armFile)) {
+            $arm = @json_decode(@file_get_contents($armFile), true);
+            $autoSendArmed = is_array($arm) && ($arm['draft_filename'] ?? '') === $draftFilename;
+        }
+
         return [
             'filename'          => $draftFilename,
             'path'              => $draftPath,
@@ -992,6 +1252,7 @@ class TicketsController extends Controller
             'subject'           => $this->extractSectionLine($markdown, 'Subject'),
             'body_markdown'     => $bodyMd,
             'body_html_preview' => $bodyHtmlPreview,
+            'auto_send_armed'   => $autoSendArmed,
         ];
     }
 

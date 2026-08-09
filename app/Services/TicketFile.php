@@ -127,6 +127,75 @@ class TicketFile
     }
 
     /**
+     * Parse `## Attachments` — the files the customer sent with the opening
+     * message, as written by `freshservice_ticket_create.py`:
+     *
+     *   - Legenda.pdf — clean ([link](./T67340-attachments/Legenda.pdf))
+     *   - shot.png (inline) — clean ([link](./T67340-attachments/shot.png))
+     *   - macro.docm — **BLOCKED**: malware scan hit
+     *   - big.zip — **DOWNLOAD FAILED**
+     *
+     * `inline` marks images already rendered inside the message body; a real
+     * file attachment (the PDF above) has no such marker and is otherwise
+     * invisible in the panel — which is why this parse exists.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function getAttachments(): array
+    {
+        $section = $this->getSection('Attachments');
+        if ($section === '' || trim($section) === '_(none)_') {
+            return [];
+        }
+
+        $out = [];
+        foreach (preg_split("/\r\n|\n|\r/", $section) as $line) {
+            $line = trim($line);
+            if ($line === '' || !str_starts_with($line, '- ')) {
+                continue;
+            }
+            // `- <filename>[ (inline)] — <status text>`
+            // Filename may contain spaces (e.g. macOS screenshots like
+            // "Zrzut ekranu 2026-07-21 o 14.26.42.png"), so match up to the
+            // " — " status separator rather than to the first whitespace.
+            if (!preg_match('/^-\s+(.+?)(\s+\(inline\))?\s+—\s+(.*)$/u', $line, $m)) {
+                continue;
+            }
+            $filename = trim($m[1]);
+            $inline = trim($m[2] ?? '') !== '';
+            $rest = trim($m[3]);
+
+            if (stripos($rest, '**BLOCKED**') !== false) {
+                $status = 'blocked';
+            } elseif (stripos($rest, '**DOWNLOAD FAILED**') !== false) {
+                $status = 'download_failed';
+            } elseif (stripos($rest, 'already downloaded') !== false) {
+                $status = 'existing';
+            } elseif (stripos($rest, 'clean') === 0) {
+                $status = 'clean';
+            } else {
+                $status = 'unknown';
+            }
+
+            // Strip the markdown link tail so `note` carries only the reason
+            // text (e.g. why it was blocked), not the plumbing.
+            $note = trim(preg_replace('/\s*\(\[link\]\([^)]*\)\)\s*$/', '', $rest));
+            $note = trim(str_replace(['**BLOCKED**:', '**BLOCKED**', '**DOWNLOAD FAILED**'], '', $note));
+
+            $out[] = [
+                'filename'   => $filename,
+                'inline'     => $inline,
+                'status'     => $status,
+                'note'       => $note,
+                // Only a file we actually hold is offerable for download.
+                'downloadable' => in_array($status, ['clean', 'existing'], true),
+            ];
+        }
+
+        return $out;
+    }
+
+    /**
      * Parse `## Replies` — each `### [n] timestamp — Name <email> (role, type)`
      * block becomes an associative array.
      *
@@ -223,7 +292,40 @@ class TicketFile
             'role' => $role,
             'type' => $type,
             'body' => $body,
+            'attachments' => self::parseReplyAttachments($body),
         ];
+    }
+
+    /**
+     * Parse a reply's `**Attachments:**` line into a list of downloadable files.
+     *
+     * The sync writes each downloaded file as `name — clean ([link](./dir/name))`,
+     * so we pull every markdown `[link](path)` and take the basename as the
+     * filename (the attachment-serving endpoint resolves it inside the ticket's
+     * attachments dir). Blocked / failed / still-pending files carry no link and
+     * are intentionally not surfaced as openable. Returns [] when the reply has
+     * no downloadable attachments.
+     *
+     * @return array<int, array{filename:string}>
+     */
+    private static function parseReplyAttachments(string $body): array
+    {
+        if (stripos($body, '**Attachments:**') === false) {
+            return [];
+        }
+        $out = [];
+        $seen = [];
+        if (preg_match_all('/\[link\]\(([^)]+)\)/', $body, $mm)) {
+            foreach ($mm[1] as $path) {
+                $filename = basename(trim($path));
+                if ($filename === '' || isset($seen[$filename])) {
+                    continue;
+                }
+                $seen[$filename] = true;
+                $out[] = ['filename' => $filename];
+            }
+        }
+        return $out;
     }
 
     /**

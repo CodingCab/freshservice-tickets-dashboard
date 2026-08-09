@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FreshService Tickets</title>
     <link rel="stylesheet" href="{{ asset('css/app.css') }}?v={{ filemtime(public_path('css/app.css')) }}">
+    {{-- Renders stored UTC timestamps in the viewer's own time zone. A plain
+         script loaded FIRST so the Vue panel and the SPA shell below share one
+         implementation rather than each growing its own. --}}
+    <script src="{{ asset('js/local-time.js') }}?v={{ filemtime(public_path('js/local-time.js')) }}"></script>
     {{-- Vite-built Vue SPA: components in resources/js/components/*.vue, registered globally on a single Vue app. --}}
     @vite('resources/js/app.js')
 </head>

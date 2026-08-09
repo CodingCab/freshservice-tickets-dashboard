@@ -37,6 +37,9 @@ import ReplyDraftModal from './components/ReplyDraftModal.vue';
  * matching public/js/app.js's BASE_URL = location.pathname convention.
  */
 const __API_BASE = window.location.pathname.replace(/\/$/, '');
+// Expose the resolved base so components can prefix URLs the browser loads
+// directly (img src, anchor href) — those bypass the fetch() wrapper below.
+window.__API_BASE = __API_BASE;
 if (__API_BASE && !window.__apiBaseShimInstalled) {
     window.__apiBaseShimInstalled = true;
     const __origFetch = window.fetch.bind(window);

@@ -1,5 +1,5 @@
 <template>
-    <div v-if="isOpen" class="rfm-overlay" @click.self="onCancel">
+    <div v-if="isOpen" class="rfm-overlay">
         <div class="rfm-modal" role="dialog" aria-label="Reject draft with feedback">
             <header class="rfm-header">
                 <h3 class="rfm-title">Reject draft &amp; send back &mdash; {{ ticketId }}</h3>
@@ -78,6 +78,7 @@
 </template>
 
 <script>
+import modalStackMixin from '../modalStackMixin';
 /**
  * RejectFeedbackModal — small modal that asks the reviewer for a short note
  * explaining what needs to change, then POSTs `/api/tickets/{id}/reject-draft`.
@@ -94,6 +95,7 @@
  * is expected to refresh its data on `@rejected`.
  */
 export default {
+    mixins: [modalStackMixin],
     name: 'RejectFeedbackModal',
     props: {
         ticketId: { type: String, default: '' },
