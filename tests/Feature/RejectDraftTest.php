@@ -96,9 +96,10 @@ class RejectDraftTest extends TestCase
             $contents
         );
 
-        // Timeline entry appended with truncated feedback.
+        // Timeline entry appended with the originating section and the feedback.
         $this->assertMatchesRegularExpression(
-            '/- \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC: Draft rejected by reviewer\. Feedback: ' . preg_quote($feedback, '/') . '\. Moving back to Reply Drafting\./',
+            '/- \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC: Draft rejected by reviewer \(from ## Security Check\)\. Feedback: '
+                . preg_quote($feedback, '/') . '\. Moving back to Reply Drafting\./',
             $contents
         );
 
@@ -154,9 +155,14 @@ class RejectDraftTest extends TestCase
         $response->assertJsonPath('error', 'validation_failed');
     }
 
-    public function test_reject_draft_409_when_ticket_in_wrong_section(): void
+    /**
+     * Rejecting is not gated by section: a reviewer saying "this draft is
+     * wrong, write another" is a decision the pipeline position never overrides.
+     * The section the ticket came from is recorded in the Timeline instead.
+     */
+    public function test_reject_draft_allowed_from_any_section(): void
     {
-        // Move the entry to a non-rejectable section in the task list.
+        // Move the entry to a section that holds no draft at all.
         file_put_contents(
             $this->tasksListPath,
             "# Tickets Task List\n\n## New\n\n- [ ] [[T{$this->ticketId}]](tasks/drafts/20260513-T{$this->ticketId}-fs-ticket.md) | **TICKET** stub\n\n## Reply Drafting\n\n## Closed\n"
@@ -166,9 +172,15 @@ class RejectDraftTest extends TestCase
             "/api/tickets/{$this->ticketId}/reject-draft",
             ['feedback' => 'this is some feedback']
         );
-        $response->assertStatus(409);
-        $response->assertJsonPath('error', 'wrong_section');
-        $response->assertJsonPath('current', 'New');
+        $response->assertStatus(200);
+        $response->assertJsonPath('status', 'rejected');
+        $response->assertJsonPath('section', 'Reply Drafting');
+
+        $contents = file_get_contents($this->draftsDir . "/20260513-T{$this->ticketId}-fs-ticket.md");
+        $this->assertStringContainsString(
+            'Draft rejected by reviewer (from ## New).',
+            $contents
+        );
     }
 
     public function test_reject_draft_truncates_long_feedback_in_timeline(): void
