@@ -1,5 +1,5 @@
 <template>
-    <div v-if="isOpen" class="mrm-overlay" @click.self="cancel">
+    <div v-if="isOpen" class="mrm-overlay">
         <div class="mrm-dialog" role="dialog" aria-modal="true" aria-label="Compose manual reply">
             <header class="mrm-header">
                 <h2 class="mrm-title">Compose reply &mdash; {{ ticketId }}</h2>
@@ -27,7 +27,15 @@
                 />
                 <div v-if="ccError" class="mrm-field-error">{{ ccError }}</div>
 
-                <label class="mrm-label" for="mrm-body">Body <span class="mrm-hint">(plain text / minimal markdown — blank line separates paragraphs)</span></label>
+                <label class="mrm-label" for="mrm-body">Body <span class="mrm-hint">(blank line separates paragraphs)</span></label>
+                <div class="mrm-toolbar">
+                    <button type="button" class="mrm-tool" title="Bold (Ctrl+B)" :disabled="sending" @click="wrap('**')"><strong>B</strong></button>
+                    <button type="button" class="mrm-tool" title="Italic (Ctrl+I)" :disabled="sending" @click="wrap('*')"><em>I</em></button>
+                    <button type="button" class="mrm-tool" title="Bullet list" :disabled="sending" @click="prefixLines('- ')">&bull; List</button>
+                    <button type="button" class="mrm-tool" title="Numbered list" :disabled="sending" @click="prefixLines('1. ')">1. List</button>
+                    <span class="mrm-saved">{{ savedHint }}</span>
+                    <button type="button" class="mrm-tool mrm-tool-discard" title="Discard the saved draft" :disabled="sending" @click="discardDraft">Discard draft</button>
+                </div>
                 <textarea
                     id="mrm-body"
                     ref="bodyRef"
@@ -36,7 +44,18 @@
                     rows="14"
                     placeholder="Hi …"
                     :disabled="sending"
+                    @keydown="onBodyKeydown"
                 ></textarea>
+
+                <div v-if="confirming && !sendSuccess" class="mrm-confirm">
+                    <div class="mrm-confirm-title">This goes straight to the customer. Are you sure?</div>
+                    <div class="mrm-confirm-text">
+                        Your message will be emailed to
+                        <strong>{{ toEmail }}</strong><span v-if="ccList.length"> (cc {{ ccList.join(', ') }})</span>
+                        as a public reply on the FreshService ticket, right now.
+                        It skips the drafter and Security Check, and <strong>it cannot be unsent.</strong>
+                    </div>
+                </div>
 
                 <div v-if="sendError" class="mrm-send-error">{{ sendError }}</div>
                 <div v-if="sendSuccess" class="mrm-send-success">
@@ -49,21 +68,29 @@
                     type="button"
                     class="btn btn-secondary"
                     :disabled="sending"
-                    @click="cancel"
-                >{{ sendSuccess ? 'Close' : 'Cancel' }}</button>
+                    @click="secondaryAction"
+                >{{ secondaryLabel }}</button>
                 <button
-                    v-if="!sendSuccess"
+                    v-if="!sendSuccess && !confirming"
                     type="button"
                     class="btn btn-primary"
                     :disabled="!canSend"
+                    @click="confirming = true"
+                >Send reply</button>
+                <button
+                    v-if="!sendSuccess && confirming"
+                    type="button"
+                    class="btn btn-danger"
+                    :disabled="!canSend"
                     @click="send"
-                >{{ sending ? 'Sending&hellip;' : 'Send reply' }}</button>
+                >{{ sending ? 'Sending&hellip;' : 'Yes, send to customer' }}</button>
             </footer>
         </div>
     </div>
 </template>
 
 <script>
+import modalStackMixin from '../modalStackMixin';
 /**
  * ManualReplyModal — compose-and-send a manual public reply.
  *
@@ -79,6 +106,7 @@
  *   - @sent  payload: server response (conversation_id, to, cc, status)
  */
 export default {
+    mixins: [modalStackMixin],
     name: 'ManualReplyModal',
     props: {
         ticketId:    { type: String, default: '' },
@@ -95,6 +123,13 @@ export default {
             sending: false,
             sendError: '',
             sendSuccess: null,
+            // Send is irreversible and leaves our system — the button arms a
+            // confirmation step rather than firing the reply straight away.
+            confirming: false,
+            // Autosave state: what the user typed survives closing the modal
+            // (and a page reload) until it is actually sent or discarded.
+            savedHint: '',
+            restored: false,
         };
     },
     computed: {
@@ -115,8 +150,14 @@ export default {
             if (this.ccError) return false;
             return true;
         },
+        secondaryLabel() {
+            if (this.sendSuccess) return 'Close';
+            return this.confirming ? 'Back' : 'Cancel';
+        },
     },
     watch: {
+        body() { this.persist(); },
+        cc()   { this.persist(); },
         isOpen(open) {
             if (open) {
                 this.reset();
@@ -127,16 +168,114 @@ export default {
         },
     },
     methods: {
+        /** localStorage key for this ticket's in-progress manual reply. */
+        storageKey() {
+            return 'ticketsMr:' + this.ticketId;
+        },
         reset() {
-            this.body = '';
-            this.cc = (this.ccEmails || []).join(', ');
             this.sending = false;
             this.sendError = '';
             this.sendSuccess = null;
+            this.confirming = false;
+            this.restored = false;
+            this.savedHint = '';
+
+            // Restore whatever was typed last time this modal was open.
+            let saved = null;
+            try {
+                const raw = window.localStorage.getItem(this.storageKey());
+                if (raw) saved = JSON.parse(raw);
+            } catch (e) { saved = null; }
+
+            this.body = (saved && typeof saved.body === 'string') ? saved.body : '';
+            this.cc = (saved && typeof saved.cc === 'string')
+                ? saved.cc
+                : (this.ccEmails || []).join(', ');
+
+            if (saved && (this.body || '').trim() !== '') {
+                this.savedHint = 'Restored unsent draft';
+            }
+            // Mark ready only after the restore assignments settle, so the
+            // watchers they trigger do not overwrite storage with defaults.
+            this.$nextTick(() => { this.restored = true; });
+        },
+        /** Persist the in-progress reply so closing the modal never loses it. */
+        persist() {
+            if (!this.isOpen || !this.restored || this.sendSuccess) return;
+            try {
+                if ((this.body || '').trim() === '') {
+                    window.localStorage.removeItem(this.storageKey());
+                    this.savedHint = '';
+                    return;
+                }
+                window.localStorage.setItem(
+                    this.storageKey(),
+                    JSON.stringify({ body: this.body, cc: this.cc })
+                );
+                this.savedHint = 'Draft saved';
+            } catch (e) { /* storage unavailable — typing still works */ }
+        },
+        clearSaved() {
+            try { window.localStorage.removeItem(this.storageKey()); } catch (e) { /* ignore */ }
+            this.savedHint = '';
+        },
+        discardDraft() {
+            if (this.sending) return;
+            this.clearSaved();
+            this.body = '';
+            this.cc = (this.ccEmails || []).join(', ');
+        },
+        /** Wrap the current selection in a markdown marker (bold / italic). */
+        wrap(marker) {
+            const el = this.$refs.bodyRef;
+            if (!el) return;
+            const start = el.selectionStart;
+            const end = el.selectionEnd;
+            const text = this.body;
+            const sel = text.slice(start, end) || 'text';
+            this.body = text.slice(0, start) + marker + sel + marker + text.slice(end);
+            this.$nextTick(() => {
+                el.focus();
+                el.setSelectionRange(start + marker.length, start + marker.length + sel.length);
+            });
+        },
+        /** Prefix every selected line (or the current line) with a list marker. */
+        prefixLines(prefix) {
+            const el = this.$refs.bodyRef;
+            if (!el) return;
+            const text = this.body;
+            const lineStart = text.lastIndexOf('\n', Math.max(0, el.selectionStart - 1)) + 1;
+            let lineEnd = text.indexOf('\n', el.selectionEnd);
+            if (lineEnd === -1) lineEnd = text.length;
+            const numbered = /^\d+\.\s/.test(prefix);
+            const lines = text.slice(lineStart, lineEnd).split('\n').map((l, i) =>
+                (numbered ? (i + 1) + '. ' : prefix) + l
+            );
+            const block = lines.join('\n');
+            this.body = text.slice(0, lineStart) + block + text.slice(lineEnd);
+            this.$nextTick(() => {
+                el.focus();
+                el.setSelectionRange(lineStart, lineStart + block.length);
+            });
+        },
+        onBodyKeydown(e) {
+            if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+            const k = (e.key || '').toLowerCase();
+            if (k === 'b') { e.preventDefault(); this.wrap('**'); }
+            else if (k === 'i') { e.preventDefault(); this.wrap('*'); }
         },
         cancel() {
             if (this.sending) return;
             this.$emit('close');
+        },
+        /** Back out of the confirmation step; otherwise close the modal. */
+        secondaryAction() {
+            if (this.sending) return;
+            if (this.confirming && !this.sendSuccess) {
+                this.confirming = false;
+                return;
+            }
+            this.cancel();
         },
         async send() {
             this.sending = true;
@@ -158,6 +297,8 @@ export default {
                     return;
                 }
                 this.sendSuccess = data;
+                // Sent for real — the saved draft has served its purpose.
+                this.clearSaved();
                 this.$emit('sent', data);
             } catch (e) {
                 this.sendError = e.message || String(e);
@@ -275,11 +416,56 @@ export default {
     outline: none;
     border-color: #1f6feb;
 }
+.mrm-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+.mrm-tool {
+    background: #21262d;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 3px 9px;
+    font-size: 12px;
+    line-height: 1.4;
+    cursor: pointer;
+}
+.mrm-tool:hover:not(:disabled) { background: #30363d; }
+.mrm-tool:disabled { opacity: 0.5; cursor: not-allowed; }
+.mrm-tool-discard { color: #8b949e; }
+.mrm-tool-discard:hover:not(:disabled) { color: #ffa198; }
+.mrm-saved {
+    margin-left: auto;
+    font-size: 11.5px;
+    color: #56d364;
+}
 .mrm-field-error {
     margin-top: 4px;
     color: #f85149;
     font-size: 12px;
 }
+
+.mrm-confirm {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 1px solid #f85149;
+    background: #2d1618;
+    border-radius: 6px;
+}
+.mrm-confirm-title {
+    color: #ffa198;
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+.mrm-confirm-text {
+    color: #e6c3c0;
+    font-size: 12.5px;
+    line-height: 1.5;
+}
+.mrm-confirm-text strong { color: #ffdad6; }
 
 .mrm-send-error {
     margin-top: 12px;
@@ -323,6 +509,12 @@ export default {
     border-color: #1f6feb;
 }
 .btn-primary:hover:not(:disabled) { background: #388bfd; }
+.btn-danger {
+    background: #da3633;
+    color: #fff;
+    border-color: #da3633;
+}
+.btn-danger:hover:not(:disabled) { background: #f85149; }
 .btn-secondary {
     background: #21262d;
     color: #c9d1d9;

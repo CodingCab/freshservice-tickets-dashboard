@@ -109,6 +109,95 @@ class FreshServiceClient
     }
 
     /**
+     * POST `/api/v2/tickets` — create a brand-new ticket.
+     *
+     * Used by the "split ticket" action: a new, standalone ticket for a second
+     * issue the customer raised in a reply, so it runs the pipeline on its own
+     * instead of tangling two topics in one thread. `email` is the requester;
+     * the ticket then looks exactly like any customer-submitted ticket.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>  The parsed `ticket` object (incl. `id`).
+     */
+    public function createTicket(array $payload): array
+    {
+        $response = $this->callPost('/api/v2/tickets', $payload);
+
+        if (!isset($response['ticket']) || !is_array($response['ticket'])) {
+            throw new RuntimeException(
+                'Unexpected FreshService response from ticket-create endpoint: '
+                . json_encode($response)
+            );
+        }
+
+        return $response['ticket'];
+    }
+
+    /**
+     * POST `/api/v2/tickets` as multipart/form-data with file attachments.
+     *
+     * FreshService only accepts files via multipart, so this uses the helper's
+     * `post-multipart` command: scalar/list fields plus one or more local file
+     * paths uploaded as `attachments[]`. Used by "split ticket" when the operator
+     * chose conversation attachments to carry over to the new ticket.
+     *
+     * @param array<string, mixed> $fields
+     * @param array<int, string>   $filePaths  absolute paths to local files
+     * @return array<string, mixed>  The parsed `ticket` object (incl. `id`).
+     */
+    public function createTicketWithAttachments(array $fields, array $filePaths): array
+    {
+        $json = json_encode($fields, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            throw new RuntimeException('Unable to JSON-encode FreshService ticket fields');
+        }
+
+        $args = ['python3', self::HELPER_PATH, 'post-multipart', '/api/v2/tickets', $json];
+        foreach ($filePaths as $p) {
+            $args[] = $p;
+        }
+
+        $process = new Process($args, null, $this->helperEnv());
+        // Uploads can be larger/slower than a JSON call — allow more time.
+        $process->setTimeout(120.0);
+
+        try {
+            $process->run();
+        } catch (\Throwable $e) {
+            throw new RuntimeException('FreshService helper failed to launch: ' . $e->getMessage(), 0, $e);
+        }
+
+        $stdout = $process->getOutput();
+        $stderr = $process->getErrorOutput();
+        if (!$process->isSuccessful()) {
+            throw new RuntimeException(
+                'FreshService helper exited with code ' . $process->getExitCode()
+                . ': ' . trim($stderr ?: $stdout)
+            );
+        }
+
+        $decoded = json_decode($stdout, true);
+        if (!is_array($decoded)) {
+            throw new RuntimeException(
+                'FreshService helper returned unparseable response. stdout: '
+                . trim($stdout) . ' | stderr: ' . trim($stderr)
+            );
+        }
+        if (isset($decoded['error']) && $decoded['error']) {
+            throw new RuntimeException(
+                'FreshService ticket-create (multipart) error: ' . json_encode($decoded['message'] ?? $decoded)
+            );
+        }
+        if (!isset($decoded['ticket']) || !is_array($decoded['ticket'])) {
+            throw new RuntimeException(
+                'Unexpected FreshService response from multipart ticket-create: ' . json_encode($decoded)
+            );
+        }
+
+        return $decoded['ticket'];
+    }
+
+    /**
      * GET `<endpoint>` — used by the dashboard to fetch ticket/conversation
      * HTML payloads for inline-image rendering.
      *

@@ -1,5 +1,5 @@
 <template>
-    <div v-if="isOpen" class="cm-overlay" @click.self="cancel">
+    <div v-if="isOpen" class="cm-overlay">
         <div class="cm-dialog" role="dialog" aria-modal="true" :aria-label="title">
             <header class="cm-header">
                 <h2 class="cm-title">{{ title }}</h2>
@@ -43,6 +43,7 @@
 </template>
 
 <script>
+import modalStackMixin from '../modalStackMixin';
 /**
  * ConfirmModal — minimal reusable confirmation dialog with optional reason field.
  *
@@ -50,6 +51,7 @@
  * The parent owns the open/busy state; this component only emits.
  */
 export default {
+    mixins: [modalStackMixin],
     name: 'ConfirmModal',
     props: {
         isOpen: { type: Boolean, default: false },

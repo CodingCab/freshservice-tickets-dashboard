@@ -7,18 +7,22 @@
             @click="emitAction('send-reply')"
         >Send draft</button>
         <button
-            v-if="!isClosed"
             type="button"
             class="btn btn-secondary"
             @click="emitAction('compose-reply')"
         >Compose reply</button>
         <button
-            v-if="!isClosed"
             type="button"
             class="btn btn-secondary"
             title="Tell the agent what to do (draft a reply, create a subtask, look up data, etc.). The agent reads the full ticket context, follows your instruction, and the result lands in the ticket's pipeline."
             @click="emitAction('ai-compose')"
         >🤖 Ask agent</button>
+        <button
+            type="button"
+            class="btn btn-secondary"
+            title="Split a second, unrelated issue the customer raised into its own new ticket (created in FreshService too). You give it a new subject + description; requester and CC carry over. This ticket stays as-is."
+            @click="emitAction('split')"
+        >✂ Split ticket</button>
         <button
             type="button"
             class="btn btn-secondary"
@@ -36,14 +40,15 @@
             title="Add a fact agents should know going forward. Triage decides where it fits; applies to all future relevant cases."
             @click="emitAction('add-knowledge-fact')"
         >📚 Add knowledge fact</button>
-        <div v-if="!isClosed" class="status-dropdown">
+        <div class="status-dropdown">
             <button
                 type="button"
                 class="btn btn-danger dropdown-toggle"
+                :title="isClosed ? 'This ticket is Closed — reopen it (Open/Pending) or change its status. You decide.' : 'Change the ticket status.'"
                 @click="toggleStatusMenu"
                 aria-haspopup="true"
                 :aria-expanded="statusMenuOpen ? 'true' : 'false'"
-            >Set status ▾</button>
+            >{{ isClosed ? 'Reopen / set status ▾' : 'Set status ▾' }}</button>
             <ul v-if="statusMenuOpen" class="status-menu" role="menu">
                 <li role="none">
                     <button type="button" role="menuitem" class="status-menu-item"
