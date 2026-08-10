@@ -472,6 +472,7 @@
                             <ul v-if="subtasksOpen" class="td-subtasks">
                                 <li v-for="(s, i) in data.subtasks" :key="i" class="td-subtask">
                                     <span class="td-checkbox">{{ s.checked ? '[x]' : '[ ]' }}</span>
+                                    <span v-if="s.task_id" class="td-related-id" :title="'tracked as ' + s.task_id">{{ s.task_id }}</span>
                                     <a v-if="s.path" href="#" @click.prevent="openSubtask(s)" class="td-subtask-title">{{ s.title }}</a>
                                     <span v-else class="td-subtask-title">{{ s.title }}</span>
                                     <span v-if="s.kind" class="td-badge">{{ s.kind }}</span>

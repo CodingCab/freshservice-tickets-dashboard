@@ -335,6 +335,11 @@ class TicketFile
      *   - [ ] [Title here](./path.md) — kind: ask-requester · depends-on: —
      *   - [x] [Title here](./path.md) — kind: consult-robert
      *
+     * A subtask that was escalated into a tracked task carries that task's id
+     * (`· task: B9993`), and its file is named after it. Either source gives
+     * the panel the id to display, so the reader can find the task on its list
+     * without opening the subtask.
+     *
      * @return array<int, array<string, mixed>>
      */
     public function getSubtasks(): array
@@ -363,11 +368,19 @@ class TicketFile
                 $kind = trim($km[1]);
             }
 
+            $taskId = '';
+            if (preg_match('/\btask:\s*([A-Z]\d{4})\b/', $tail, $tm)) {
+                $taskId = $tm[1];
+            } elseif (preg_match('/[-\/]([A-Z]\d{4})-/', $path, $pm)) {
+                $taskId = $pm[1];
+            }
+
             $subtasks[] = [
                 'checked' => $checked,
                 'title' => $title,
                 'path' => $path,
                 'kind' => $kind,
+                'task_id' => $taskId,
             ];
         }
 
