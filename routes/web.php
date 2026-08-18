@@ -17,6 +17,7 @@ Route::get('/api/health/freshservice', [TicketsController::class, 'health']);
 Route::get('/api/agents', [TicketsController::class, 'agents']);
 Route::get('/api/ai-sessions', [TicketsController::class, 'aiSessions']);
 Route::get('/api/automation-feedback', [TicketsController::class, 'automationFeedback']);
+Route::get('/api/agents/usage', [TicketsController::class, 'agentUsage']);
 Route::get('/api/agents/{id}/output', [TicketsController::class, 'agentOutput']);
 
 Route::get('/api/tickets/{id}/detail', [TicketsController::class, 'detail']);
