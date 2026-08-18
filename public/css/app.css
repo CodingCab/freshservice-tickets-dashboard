@@ -473,3 +473,25 @@ tr.row-selected:hover td { background: #1b3050; }
     background: #12261a; border: 1px solid #3fb950;
 }
 .bulk-toast.bulk-toast-error { background: #2d1618; border-color: #f85149; }
+
+/* ─── Usage limits charts (Agents tab) ─────────────────────────── */
+.usage-section { position: relative; margin: 10px 0 14px; }
+.usage-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+.usage-head h2 { font-size: 0.95em; margin: 0; color: #e1e4e8; }
+.usage-sub { font-size: 0.72em; color: #8b949e; }
+.usage-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-left: auto; }
+.usage-key { font-size: 0.72em; color: #c9d1d9; display: inline-flex; align-items: center; gap: 5px; }
+.usage-chip { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+.usage-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 900px) { .usage-charts { grid-template-columns: 1fr; } }
+.usage-chart { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px 4px; min-width: 0; }
+.usage-chart h3 { font-size: 0.75em; font-weight: 600; color: #8b949e; margin: 0 0 4px; }
+.usage-plot svg { display: block; max-width: 100%; }
+.usage-tick { fill: #8b949e; font-size: 10px; font-variant-numeric: tabular-nums; }
+.usage-endlabel { font-size: 10px; }
+.usage-endlabel-ink { fill: #c9d1d9; }
+.usage-empty { color: #8b949e; font-size: 0.8em; padding: 24px 8px; text-align: center; }
+.usage-tooltip { position: absolute; z-index: 30; background: #21262d; border: 1px solid #30363d; border-radius: 6px; padding: 6px 9px; font-size: 0.72em; color: #e1e4e8; pointer-events: none; box-shadow: 0 4px 14px rgba(0,0,0,0.4); max-width: 340px; }
+.usage-tip-time { color: #8b949e; margin-bottom: 3px; }
+.usage-tip-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; margin: 1px 0; }
+.usage-tip-muted { color: #8b949e; }

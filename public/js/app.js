@@ -890,6 +890,24 @@ function renderApp() {
                 <div class="columns-grid" id="columnsGrid"></div>
             </div>
             <div class="stats" id="agentStats"></div>
+            <div class="usage-section">
+                <div class="usage-head">
+                    <h2>Usage limits</h2>
+                    <span class="usage-sub">% of each account's rate limit used, snapshotted after every agent job</span>
+                    <div class="usage-legend" id="usageLegend"></div>
+                </div>
+                <div class="usage-charts">
+                    <div class="usage-chart">
+                        <h3>Session (5-hour) window</h3>
+                        <div class="usage-plot" id="usagePlot5h"></div>
+                    </div>
+                    <div class="usage-chart">
+                        <h3>Weekly (7-day) window</h3>
+                        <div class="usage-plot" id="usagePlot7d"></div>
+                    </div>
+                </div>
+                <div class="usage-tooltip" id="usageTooltip" style="display:none;"></div>
+            </div>
             <div class="filters">
                 <input type="text" id="agentSearch" placeholder="Search agents..." oninput="renderAgentTable()">
                 <button class="filter-btn active" data-agent-filter="all" onclick="setAgentFilter('all')">All</button>
@@ -909,7 +927,7 @@ function renderApp() {
                     <input type="date" id="agentSinceDate" onchange="loadAgents()">
                     <input type="date" id="agentUntilDate" onchange="loadAgents()">
                 </span>
-                <select id="agentUserFilter" onchange="renderAgentTable()"><option value="">All users</option></select>
+                <select id="agentUserFilter" onchange="renderAgentTable();renderUsageCharts()"><option value="">All users</option></select>
                 <select id="agentModelFilter" onchange="renderAgentTable()"><option value="">All models</option></select>
                 <select id="agentSourceFilter" onchange="renderAgentTable()"><option value="">All sources</option></select>
             </div>
@@ -1215,6 +1233,7 @@ async function loadAgents() {
         rebuildAgentFilterOptions();
         renderAgentStats();
         renderAgentTable();
+        loadUsage();
     } catch (e) {
         const cols = getVisibleColumns().length;
         document.getElementById('agentBody').innerHTML =
@@ -2143,3 +2162,218 @@ document.addEventListener('keydown', e => {
 }, true);
 // NOTE: backdrop-click-to-close is intentionally removed — clicking outside a
 // modal must never close it.
+
+// ─── Usage Limits Charts ────────────────────────────────────────
+// Per-account rate-limit utilization over time, from /api/agents/usage
+// (fed by /shared/logs/agent-usage/*.jsonl — one snapshot per finished
+// agent job). Two small multiples on a shared 0–100% scale: the 5-hour
+// session window and the 7-day weekly window.
+
+let usageData = {};          // user -> [{ts, five_hour, seven_day, ...}]
+const USAGE_API = BASE_URL + '/api/agents/usage';
+
+// Validated categorical palette (dark surface #161b22): fixed slot order,
+// color follows the account — filtering never repaints survivors.
+const USAGE_COLORS = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'];
+const USAGE_USER_ORDER = ['adam', 'adam_airforce1', 'adam_airforce2', 'robert', 'artur', 'chris'];
+
+function usageColor(user) {
+    let idx = USAGE_USER_ORDER.indexOf(user);
+    if (idx === -1) {
+        const extras = Object.keys(usageData).filter(u => !USAGE_USER_ORDER.includes(u)).sort();
+        idx = USAGE_USER_ORDER.length + extras.indexOf(user);
+    }
+    return USAGE_COLORS[idx % USAGE_COLORS.length];
+}
+
+async function loadUsage() {
+    try {
+        const resp = await fetch(USAGE_API + '?t=' + Date.now() + agentRangeParams());
+        const data = await resp.json();
+        usageData = data.users || {};
+    } catch (e) {
+        usageData = {};
+    }
+    renderUsageCharts();
+}
+
+function usageTimeDomain() {
+    const now = Date.now();
+    const hours = { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 };
+    if (agentRange in hours) return [now - hours[agentRange] * 3600e3, now];
+    if (agentRange === 'custom') {
+        const since = document.getElementById('agentSinceDate')?.value;
+        const until = document.getElementById('agentUntilDate')?.value;
+        return [since ? new Date(since + 'T00:00:00').getTime() : now - 24 * 3600e3,
+                until ? new Date(until + 'T23:59:59').getTime() : now];
+    }
+    let min = Infinity;
+    for (const pts of Object.values(usageData)) for (const pt of pts) min = Math.min(min, Date.parse(pt.ts));
+    return [isFinite(min) ? min : now - 24 * 3600e3, now];
+}
+
+function usageVisibleUsers() {
+    const sel = document.getElementById('agentUserFilter')?.value || '';
+    let users = Object.keys(usageData).sort((a, b) => a.localeCompare(b));
+    if (sel) users = users.filter(u => u === sel);
+    return users;
+}
+
+function usageTimeTicks(t0, t1, n) {
+    const ticks = [];
+    for (let i = 0; i <= n; i++) ticks.push(t0 + (t1 - t0) * i / n);
+    return ticks;
+}
+
+function usageFmtTime(ms, spanMs) {
+    const d = new Date(ms);
+    const hm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (spanMs <= 26 * 3600e3) return hm;
+    const dm = d.toLocaleDateString([], { day: 'numeric', month: 'short' });
+    return spanMs <= 8 * 24 * 3600e3 ? dm + ' ' + hm : dm;
+}
+
+function renderUsageCharts() {
+    renderUsageChart('usagePlot5h', 'five_hour');
+    renderUsageChart('usagePlot7d', 'seven_day');
+    renderUsageLegend();
+}
+
+function renderUsageLegend() {
+    const el = document.getElementById('usageLegend');
+    if (!el) return;
+    const users = usageVisibleUsers();
+    el.innerHTML = users.map(u =>
+        `<span class="usage-key"><span class="usage-chip" style="background:${usageColor(u)}"></span>${esc(u)}</span>`
+    ).join('');
+}
+
+function renderUsageChart(elId, field) {
+    const host = document.getElementById(elId);
+    if (!host) return;
+    const users = usageVisibleUsers();
+    const series = users.map(u => ({
+        user: u,
+        pts: (usageData[u] || [])
+            .filter(pt => pt[field] != null)
+            .map(pt => ({ t: Date.parse(pt.ts), v: Math.max(0, Math.min(100, pt[field])), raw: pt })),
+    })).filter(sr => sr.pts.length);
+
+    if (!series.length) {
+        host.innerHTML = '<div class="usage-empty">No usage snapshots in this range yet.</div>';
+        return;
+    }
+
+    const W = Math.max(host.clientWidth || 500, 320), H = 190;
+    const direct = series.length <= 4;
+    const m = { l: 36, r: direct ? 110 : 14, t: 10, b: 24 };
+    const [t0, t1] = usageTimeDomain();
+    const x = t => m.l + (W - m.l - m.r) * (t - t0) / Math.max(t1 - t0, 1);
+    const y = v => m.t + (H - m.t - m.b) * (1 - v / 100);
+
+    let g = '';
+    for (const v of [0, 25, 50, 75, 100]) {
+        const yy = y(v);
+        g += `<line x1="${m.l}" x2="${W - m.r}" y1="${yy}" y2="${yy}" stroke="${v === 0 ? '#30363d' : '#21262d'}" stroke-width="1"/>`;
+        g += `<text x="${m.l - 6}" y="${yy + 3}" text-anchor="end" class="usage-tick">${v}%</text>`;
+    }
+    const spanMs = t1 - t0;
+    for (const tk of usageTimeTicks(t0, t1, 4)) {
+        g += `<text x="${x(tk)}" y="${H - 6}" text-anchor="middle" class="usage-tick">${esc(usageFmtTime(tk, spanMs))}</text>`;
+    }
+
+    let lines = '', labels = [];
+    for (const sr of series) {
+        const c = usageColor(sr.user);
+        const pts = sr.pts;
+        const d = pts.map((pt, i) => (i ? 'L' : 'M') + x(pt.t).toFixed(1) + ' ' + y(pt.v).toFixed(1)).join(' ');
+        lines += `<path d="${d}" fill="none" stroke="${c}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+        if (pts.length === 1) {
+            const pt = pts[0];
+            lines += `<circle cx="${x(pt.t).toFixed(1)}" cy="${y(pt.v).toFixed(1)}" r="3" fill="${c}" stroke="#161b22" stroke-width="2"/>`;
+        }
+        if (direct) {
+            const last = pts[pts.length - 1];
+            labels.push({ y: y(last.v), color: c, text: sr.user });
+        }
+    }
+    // De-collide direct end-labels (12px line height).
+    labels.sort((a, b) => a.y - b.y);
+    for (let i = 1; i < labels.length; i++) labels[i].y = Math.max(labels[i].y, labels[i - 1].y + 13);
+    const labelSvg = labels.map(lb =>
+        `<text x="${W - m.r + 8}" y="${Math.min(lb.y, H - m.b - 2) + 3}" class="usage-endlabel" fill="${lb.color}">` +
+        `<tspan class="usage-endlabel-ink">${esc(lb.text)}</tspan></text>` +
+        `<circle cx="${W - m.r + 3}" cy="${Math.min(lb.y, H - m.b - 2)}" r="3" fill="${lb.color}"/>`
+    ).join('');
+
+    host.innerHTML =
+        `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" data-field="${field}">` +
+        g + lines + labelSvg +
+        `<line class="usage-cross" x1="0" x2="0" y1="${m.t}" y2="${H - m.b}" stroke="#484f58" stroke-width="1" style="display:none;"/>` +
+        `<g class="usage-hover"></g>` +
+        `<rect class="usage-capture" x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${H - m.t - m.b}" fill="transparent"/>` +
+        `</svg>`;
+
+    const svg = host.querySelector('svg');
+    const capture = svg.querySelector('.usage-capture');
+    capture.addEventListener('mousemove', ev => usageHover(ev, svg, series, { x, y, t0, t1, spanMs }));
+    capture.addEventListener('mouseleave', () => usageHoverEnd(svg));
+}
+
+function usageHover(ev, svg, series, scale) {
+    const rect = svg.getBoundingClientRect();
+    const px = (ev.clientX - rect.left) * (svg.viewBox.baseVal.width / rect.width);
+    // Nearest snapshot per series to the cursor's x position.
+    const rows = [];
+    let anchorX = null, anchorT = null;
+    for (const sr of series) {
+        let best = null, bestDx = Infinity;
+        for (const pt of sr.pts) {
+            const dx = Math.abs(scale.x(pt.t) - px);
+            if (dx < bestDx) { bestDx = dx; best = pt; }
+        }
+        if (best && bestDx < 60) {
+            rows.push({ sr, pt: best });
+            if (anchorX === null || Math.abs(scale.x(best.t) - px) < Math.abs(anchorX - px)) {
+                anchorX = scale.x(best.t); anchorT = best.t;
+            }
+        }
+    }
+    const cross = svg.querySelector('.usage-cross');
+    const hover = svg.querySelector('.usage-hover');
+    const tip = document.getElementById('usageTooltip');
+    if (!rows.length) { usageHoverEnd(svg); return; }
+    cross.style.display = '';
+    cross.setAttribute('x1', anchorX); cross.setAttribute('x2', anchorX);
+    hover.innerHTML = rows.map(r =>
+        `<circle cx="${scale.x(r.pt.t).toFixed(1)}" cy="${scale.y(r.pt.v).toFixed(1)}" r="4" fill="${usageColor(r.sr.user)}" stroke="#161b22" stroke-width="2"/>`
+    ).join('');
+    const field = svg.dataset.field;
+    const fmtReset = iso => iso ? new Date(iso).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : null;
+    tip.style.display = '';
+    tip.innerHTML =
+        `<div class="usage-tip-time">${esc(usageFmtTime(anchorT, 9e99))}</div>` +
+        rows.sort((a, b) => b.pt.v - a.pt.v).map(r => {
+            const resetKey = field === 'five_hour' ? 'five_hour_resets_at' : 'seven_day_resets_at';
+            const reset = fmtReset(r.pt.raw[resetKey]);
+            const stale = r.pt.raw.fetched_at_ms && (r.pt.t - r.pt.raw.fetched_at_ms) > 6 * 3600e3;
+            return `<div class="usage-tip-row"><span class="usage-chip" style="background:${usageColor(r.sr.user)}"></span>` +
+                `${esc(r.sr.user)} <strong>${r.pt.v}%</strong>` +
+                (reset ? ` <span class="usage-tip-muted">resets ${esc(reset)}</span>` : '') +
+                (stale ? ' <span class="usage-tip-muted">(stale cache)</span>' : '') + `</div>`;
+        }).join('');
+    const page = svg.closest('.usage-section').getBoundingClientRect();
+    tip.style.left = Math.min(ev.clientX - page.left + 14, page.width - tip.offsetWidth - 8) + 'px';
+    tip.style.top = (ev.clientY - page.top + 14) + 'px';
+}
+
+function usageHoverEnd(svg) {
+    svg.querySelector('.usage-cross').style.display = 'none';
+    svg.querySelector('.usage-hover').innerHTML = '';
+    const tip = document.getElementById('usageTooltip');
+    if (tip) tip.style.display = 'none';
+}
+
+window.addEventListener('resize', () => {
+    if (document.getElementById('agents-tab')?.style.display !== 'none') renderUsageCharts();
+});

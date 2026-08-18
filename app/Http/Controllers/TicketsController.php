@@ -450,6 +450,57 @@ class TicketsController extends Controller
     }
 
     /**
+     * Usage-limit history per agent account — one JSONL file per user under
+     * /shared/logs/agent-usage/, appended after every completed agent job
+     * (queue OnJobCompleted handler) and after interactive turns (Stop hook).
+     * Each entry snapshots the account's cached limit utilization: five-hour
+     * and seven-day window percentages plus reset times.
+     */
+    public function agentUsage(Request $request)
+    {
+        $since = $request->query('since');
+        $until = $request->query('until');
+        $sinceTs = $since ? strtotime($since) : null;
+        $untilTs = $until ? strtotime($until) : null;
+
+        $users = [];
+        $dir = config('dashboard.agent_usage_dir') ?: '/shared/logs/agent-usage';
+        foreach (glob($dir . '/*.jsonl') ?: [] as $file) {
+            if (!is_readable($file)) continue;
+            $user = basename($file, '.jsonl');
+            $points = [];
+            $fh = fopen($file, 'r');
+            if (!$fh) continue;
+            while (($line = fgets($fh)) !== false) {
+                $e = @json_decode($line, true);
+                if (!$e || empty($e['ts'])) continue;
+                $ts = strtotime($e['ts']);
+                if ($ts === false) continue;
+                if ($sinceTs && $ts < $sinceTs) continue;
+                if ($untilTs && $ts > $untilTs) continue;
+                $u = $e['utilization'] ?? null;
+                if (!is_array($u)) continue;
+                $points[] = [
+                    'ts' => gmdate('c', $ts),
+                    'five_hour' => $u['five_hour']['utilization'] ?? null,
+                    'seven_day' => $u['seven_day']['utilization'] ?? null,
+                    'five_hour_resets_at' => $u['five_hour']['resets_at'] ?? null,
+                    'seven_day_resets_at' => $u['seven_day']['resets_at'] ?? null,
+                    'fetched_at_ms' => $e['fetched_at_ms'] ?? null,
+                    'task_id' => $e['task_id'] ?? null,
+                ];
+            }
+            fclose($fh);
+            if ($points) {
+                usort($points, fn($a, $b) => strcmp($a['ts'], $b['ts']));
+                $users[$user] = $points;
+            }
+        }
+        ksort($users);
+        return response()->json(['users' => $users]);
+    }
+
+    /**
      * Serve a ticket attachment (inline image or file) from the sibling
      * `T{id}-attachments/` directory next to the ticket .md file.
      *
