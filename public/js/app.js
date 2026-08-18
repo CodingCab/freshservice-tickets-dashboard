@@ -893,7 +893,14 @@ function renderApp() {
             <div class="usage-section">
                 <div class="usage-head">
                     <h2>Usage limits</h2>
-                    <span class="usage-sub">% of each account's rate limit used, snapshotted after every agent job</span>
+                    <span class="usage-sub">peak % of each account's rate limit per period, snapshotted after every agent job</span>
+                    <span class="usage-ranges">
+                        <button class="filter-btn" data-usage-range="24h" onclick="setUsageRange('24h')">24h</button>
+                        <button class="filter-btn" data-usage-range="3d" onclick="setUsageRange('3d')">3 days</button>
+                        <button class="filter-btn active" data-usage-range="7d" onclick="setUsageRange('7d')">7 days</button>
+                        <button class="filter-btn" data-usage-range="14d" onclick="setUsageRange('14d')">14 days</button>
+                        <button class="filter-btn" data-usage-range="30d" onclick="setUsageRange('30d')">30 days</button>
+                    </span>
                     <div class="usage-legend" id="usageLegend"></div>
                 </div>
                 <div class="usage-charts">
@@ -2172,6 +2179,21 @@ document.addEventListener('keydown', e => {
 let usageData = {};          // user -> [{ts, five_hour, seven_day, ...}]
 const USAGE_API = BASE_URL + '/api/agents/usage';
 
+// The usage charts have their own range, independent of the table's filter:
+// the default question is "where were we against the limits this week, and
+// at what times of day" — so 7 days, aggregated into equal periods.
+let usageRange = '7d';
+const USAGE_RANGES = { '24h': 24, '3d': 72, '7d': 168, '14d': 336, '30d': 720 };
+// Bucket width per range: equal periods, peak utilization per period.
+const USAGE_BUCKETS = { '24h': 1, '3d': 3, '7d': 3, '14d': 6, '30d': 12 };
+
+function setUsageRange(range) {
+    usageRange = range;
+    document.querySelectorAll('[data-usage-range]').forEach(b =>
+        b.classList.toggle('active', b.dataset.usageRange === range));
+    loadUsage();
+}
+
 // Validated categorical palette (dark surface #161b22): fixed slot order,
 // color follows the account — filtering never repaints survivors.
 const USAGE_COLORS = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'];
@@ -2188,7 +2210,9 @@ function usageColor(user) {
 
 async function loadUsage() {
     try {
-        const resp = await fetch(USAGE_API + '?t=' + Date.now() + agentRangeParams());
+        const [t0] = usageTimeDomain();
+        const resp = await fetch(USAGE_API + '?t=' + Date.now() +
+            '&since=' + encodeURIComponent(new Date(t0).toISOString()));
         const data = await resp.json();
         usageData = data.users || {};
     } catch (e) {
@@ -2199,17 +2223,35 @@ async function loadUsage() {
 
 function usageTimeDomain() {
     const now = Date.now();
-    const hours = { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 };
-    if (agentRange in hours) return [now - hours[agentRange] * 3600e3, now];
-    if (agentRange === 'custom') {
-        const since = document.getElementById('agentSinceDate')?.value;
-        const until = document.getElementById('agentUntilDate')?.value;
-        return [since ? new Date(since + 'T00:00:00').getTime() : now - 24 * 3600e3,
-                until ? new Date(until + 'T23:59:59').getTime() : now];
+    const bucketMs = USAGE_BUCKETS[usageRange] * 3600e3;
+    // Align the window to whole buckets so periods are equal and stable.
+    const end = Math.ceil(now / bucketMs) * bucketMs;
+    return [end - USAGE_RANGES[usageRange] * 3600e3, end];
+}
+
+// Equal periods, peak per period: within each bucket keep the snapshot with
+// the highest utilization (the question is "did we hit the limit then").
+function usageBucketize(pts, field, t0, bucketMs) {
+    const buckets = new Map();
+    for (const pt of pts) {
+        if (pt[field] == null) continue;
+        const idx = Math.floor((Date.parse(pt.ts) - t0) / bucketMs);
+        if (idx < 0) continue;
+        const cur = buckets.get(idx);
+        if (!cur || pt[field] > cur.raw[field]) {
+            buckets.set(idx, { count: (cur?.count || 0) + 1, raw: pt });
+        } else {
+            cur.count++;
+        }
     }
-    let min = Infinity;
-    for (const pts of Object.values(usageData)) for (const pt of pts) min = Math.min(min, Date.parse(pt.ts));
-    return [isFinite(min) ? min : now - 24 * 3600e3, now];
+    return [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([idx, b]) => ({
+        t: t0 + (idx + 0.5) * bucketMs,
+        bucketStart: t0 + idx * bucketMs,
+        bucketEnd: t0 + (idx + 1) * bucketMs,
+        v: Math.max(0, Math.min(100, b.raw[field])),
+        count: b.count,
+        raw: b.raw,
+    }));
 }
 
 function usageVisibleUsers() {
@@ -2219,9 +2261,24 @@ function usageVisibleUsers() {
     return users;
 }
 
-function usageTimeTicks(t0, t1, n) {
+function usageTimeTicks(t0, t1) {
+    const span = t1 - t0;
+    if (span <= 26 * 3600e3) {
+        const ticks = [];
+        for (let i = 0; i <= 4; i++) ticks.push(t0 + span * i / 4);
+        return ticks;
+    }
+    // Multi-day: tick on local midnights so day/night periods line up.
+    const days = span / (24 * 3600e3);
+    const stepDays = days <= 8 ? 1 : days <= 16 ? 2 : 5;
     const ticks = [];
-    for (let i = 0; i <= n; i++) ticks.push(t0 + (t1 - t0) * i / n);
+    const d = new Date(t0);
+    d.setHours(0, 0, 0, 0);
+    if (d.getTime() < t0) d.setDate(d.getDate() + 1);
+    while (d.getTime() <= t1) {
+        ticks.push(d.getTime());
+        d.setDate(d.getDate() + stepDays);
+    }
     return ticks;
 }
 
@@ -2252,11 +2309,11 @@ function renderUsageChart(elId, field) {
     const host = document.getElementById(elId);
     if (!host) return;
     const users = usageVisibleUsers();
+    const [t0, t1] = usageTimeDomain();
+    const bucketMs = USAGE_BUCKETS[usageRange] * 3600e3;
     const series = users.map(u => ({
         user: u,
-        pts: (usageData[u] || [])
-            .filter(pt => pt[field] != null)
-            .map(pt => ({ t: Date.parse(pt.ts), v: Math.max(0, Math.min(100, pt[field])), raw: pt })),
+        pts: usageBucketize(usageData[u] || [], field, t0, bucketMs),
     })).filter(sr => sr.pts.length);
 
     if (!series.length) {
@@ -2267,7 +2324,6 @@ function renderUsageChart(elId, field) {
     const W = Math.max(host.clientWidth || 500, 320), H = 190;
     const direct = series.length <= 4;
     const m = { l: 36, r: direct ? 110 : 14, t: 10, b: 24 };
-    const [t0, t1] = usageTimeDomain();
     const x = t => m.l + (W - m.l - m.r) * (t - t0) / Math.max(t1 - t0, 1);
     const y = v => m.t + (H - m.t - m.b) * (1 - v / 100);
 
@@ -2278,19 +2334,30 @@ function renderUsageChart(elId, field) {
         g += `<text x="${m.l - 6}" y="${yy + 3}" text-anchor="end" class="usage-tick">${v}%</text>`;
     }
     const spanMs = t1 - t0;
-    for (const tk of usageTimeTicks(t0, t1, 4)) {
-        g += `<text x="${x(tk)}" y="${H - 6}" text-anchor="middle" class="usage-tick">${esc(usageFmtTime(tk, spanMs))}</text>`;
+    const dayTicks = spanMs > 26 * 3600e3;
+    for (const tk of usageTimeTicks(t0, t1)) {
+        if (dayTicks) g += `<line x1="${x(tk).toFixed(1)}" x2="${x(tk).toFixed(1)}" y1="${m.t}" y2="${H - m.b}" stroke="#21262d" stroke-width="1"/>`;
+        const lbl = dayTicks
+            ? new Date(tk).toLocaleDateString([], { weekday: 'short', day: 'numeric' })
+            : usageFmtTime(tk, spanMs);
+        g += `<text x="${x(tk)}" y="${H - 6}" text-anchor="middle" class="usage-tick">${esc(lbl)}</text>`;
     }
 
     let lines = '', labels = [];
     for (const sr of series) {
         const c = usageColor(sr.user);
         const pts = sr.pts;
-        const d = pts.map((pt, i) => (i ? 'L' : 'M') + x(pt.t).toFixed(1) + ' ' + y(pt.v).toFixed(1)).join(' ');
+        // Break the line where buckets are missing — an empty period is
+        // "no snapshots", not an interpolated value.
+        const bucketGap = (USAGE_BUCKETS[usageRange] * 3600e3) * 1.5;
+        let d = '';
+        pts.forEach((pt, i) => {
+            const move = i === 0 || (pt.t - pts[i - 1].t) > bucketGap;
+            d += (move ? 'M' : 'L') + x(pt.t).toFixed(1) + ' ' + y(pt.v).toFixed(1) + ' ';
+        });
         lines += `<path d="${d}" fill="none" stroke="${c}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
-        if (pts.length === 1) {
-            const pt = pts[0];
-            lines += `<circle cx="${x(pt.t).toFixed(1)}" cy="${y(pt.v).toFixed(1)}" r="3" fill="${c}" stroke="#161b22" stroke-width="2"/>`;
+        for (const pt of pts) {
+            lines += `<circle cx="${x(pt.t).toFixed(1)}" cy="${y(pt.v).toFixed(1)}" r="2.5" fill="${c}" stroke="#161b22" stroke-width="1.5"/>`;
         }
         if (direct) {
             const last = pts[pts.length - 1];
@@ -2351,14 +2418,19 @@ function usageHover(ev, svg, series, scale) {
     const field = svg.dataset.field;
     const fmtReset = iso => iso ? new Date(iso).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : null;
     tip.style.display = '';
+    const anchor = rows[0].pt;
+    const fmtHM = ms => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const periodLabel = new Date(anchor.bucketStart).toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' }) +
+        ' ' + fmtHM(anchor.bucketStart) + '–' + fmtHM(anchor.bucketEnd);
     tip.innerHTML =
-        `<div class="usage-tip-time">${esc(usageFmtTime(anchorT, 9e99))}</div>` +
+        `<div class="usage-tip-time">${esc(periodLabel)}</div>` +
         rows.sort((a, b) => b.pt.v - a.pt.v).map(r => {
             const resetKey = field === 'five_hour' ? 'five_hour_resets_at' : 'seven_day_resets_at';
             const reset = fmtReset(r.pt.raw[resetKey]);
-            const stale = r.pt.raw.fetched_at_ms && (r.pt.t - r.pt.raw.fetched_at_ms) > 6 * 3600e3;
+            const stale = r.pt.raw.fetched_at_ms && (Date.parse(r.pt.raw.ts) - r.pt.raw.fetched_at_ms) > 6 * 3600e3;
             return `<div class="usage-tip-row"><span class="usage-chip" style="background:${usageColor(r.sr.user)}"></span>` +
-                `${esc(r.sr.user)} <strong>${r.pt.v}%</strong>` +
+                `${esc(r.sr.user)} <strong>peak ${r.pt.v}%</strong>` +
+                ` <span class="usage-tip-muted">(${r.pt.count} snapshot${r.pt.count === 1 ? '' : 's'})</span>` +
                 (reset ? ` <span class="usage-tip-muted">resets ${esc(reset)}</span>` : '') +
                 (stale ? ' <span class="usage-tip-muted">(stale cache)</span>' : '') + `</div>`;
         }).join('');
