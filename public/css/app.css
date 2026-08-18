@@ -495,3 +495,5 @@ tr.row-selected:hover td { background: #1b3050; }
 .usage-tip-time { color: #8b949e; margin-bottom: 3px; }
 .usage-tip-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; margin: 1px 0; }
 .usage-tip-muted { color: #8b949e; }
+.usage-ranges { display: inline-flex; gap: 4px; }
+.usage-ranges .filter-btn { padding: 2px 8px; font-size: 0.7em; }
