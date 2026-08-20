@@ -500,6 +500,7 @@
                                     <span class="td-cell td-cell-right">KIND</span>
                                     <span class="td-cell td-cell-right">REPLY</span>
                                 </li>
+                                <li class="td-head-rule"></li>
                                 <li v-for="(s, i) in data.subtasks" :key="i" class="td-subtask">
                                     <span class="td-cell td-checkbox">{{ s.checked ? '[x]' : '[ ]' }}</span>
                                     <span class="td-cell">
@@ -560,6 +561,7 @@
                                     <span class="td-cell td-cell-right">LIST</span>
                                     <span class="td-cell td-cell-right"></span>
                                 </li>
+                                <li class="td-head-rule"></li>
                                 <li v-for="t in data.related_tasks" :key="t.task_id + '-' + t.list" class="td-related-task">
                                     <span class="td-cell td-checkbox">{{ t.checked ? '[x]' : '[ ]' }}</span>
                                     <span class="td-cell">
@@ -2845,8 +2847,15 @@ export default {
     font-size: 10px;
     letter-spacing: 0.06em;
     color: #6e7681;
-    border-bottom: 1px solid #21262d;
     padding-bottom: 3px;
+}
+/* … the line under the headers is drawn ONCE, by an element spanning every
+   column. Drawn per cell it came out in segments: each cell's border ends where
+   its own text-spacing ends, so the rule broke wherever a column did. */
+.td-head-rule {
+    grid-column: 1 / -1;
+    border-bottom: 1px solid #21262d;
+    margin-bottom: 3px;
 }
 .td-col-empty    { color: #484f58; }
 .td-stage-pill {
