@@ -57,8 +57,31 @@ class ReplyHtmlBuilder
      */
     public static function fromBodyMarkdown(string $bodyMarkdown): string
     {
+        // Verbatim. Text the operator typed or pasted into the panel is theirs:
+        // whatever they wrote is what goes out, headings and all. Nothing here
+        // second-guesses or filters it. (The panel is kept clean at the source
+        // instead — a draft file carries the reply and nothing else.)
         $text = preg_replace("/\r\n|\r/", "\n", $bodyMarkdown) ?? '';
         return self::renderBody(trim($text));
+    }
+
+    /**
+     * Cut a draft FILE's body at the first `## …` heading and drop a trailing
+     * horizontal rule.
+     *
+     * Applies only to text read out of a draft file — never to anything a
+     * person typed. A draft file must carry the reply and nothing else, and
+     * this is the backstop for the day an agent appends its working notes
+     * anyway (T67887, 2026-08-12).
+     */
+    public static function stripInternalSections(string $body): string
+    {
+        $text = preg_replace("/\r\n|\r/", "\n", $body) ?? '';
+        if (preg_match('/^##\s+/m', $text, $m, PREG_OFFSET_CAPTURE)) {
+            $text = substr($text, 0, $m[0][1]);
+        }
+        $text = preg_replace('/\n\s*(?:-{3,}|\*{3,}|_{3,})\s*$/', '', rtrim($text)) ?? $text;
+        return trim($text);
     }
 
     /**
@@ -175,7 +198,10 @@ class ReplyHtmlBuilder
         }
         unset($line);
 
-        return implode("\n", $lines);
+        // The `---` a draft puts between the reply and its internal tail is left
+        // behind once the tail is cut above — it is a separator, not content, and
+        // must not travel to the customer.
+        return self::stripInternalSections(implode("\n", $lines));
     }
 
     /**

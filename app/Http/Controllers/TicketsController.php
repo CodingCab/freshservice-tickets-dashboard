@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Services\ReplyHtmlBuilder;
+use App\Services\TaskStages;
 use App\Services\TicketFile;
 use App\Services\TicketHtmlEnricher;
 use Illuminate\Http\Request;
@@ -571,19 +572,25 @@ class TicketsController extends Controller
     }
 
     /**
-     * Serve the raw markdown content of a subtask file linked from a ticket's
-     * `## Subtasks` section. The subtask must live in the same directory as
-     * the parent ticket file, and the filename must match the strict regex
-     * enforced by the route.
+     * Serve the raw markdown content of a task file linked from a ticket's
+     * `## Subtasks` section, given as `?path=` relative to the ticket file.
      *
-     * Returns JSON `{ filename, content }` on success.
+     * The link is NOT always a sibling of the ticket: spawned subtasks live
+     * next to it (`./file.md`), while filed/linked tasks live one level up in
+     * the shared tasks directory (`../file.md`). Both must open — restricting
+     * this to the ticket's own directory 404'd every tracked task (B/F ids).
+     * Containment is therefore enforced against the task-lists root that holds
+     * the ticket directory, not against the ticket directory itself.
+     *
+     * Returns JSON `{ filename, path, content }` on success.
      */
-    public function subtask(string $ticketId, string $filename)
+    public function subtask(string $ticketId, Request $request)
     {
-        if (str_contains($filename, '/') || str_contains($filename, '..')) {
+        $path = (string) $request->query('path', '');
+        if ($path === '' || str_starts_with($path, '/')) {
             return response()->json(['error' => 'invalid_filename'], 400);
         }
-        if (!str_ends_with(strtolower($filename), '.md')) {
+        if (!str_ends_with(strtolower($path), '.md')) {
             return response()->json(['error' => 'invalid_filename'], 400);
         }
 
@@ -592,14 +599,16 @@ class TicketsController extends Controller
             return response()->json(['error' => 'ticket_file_not_found'], 404);
         }
         $ticketDir = dirname($ticketFile->getPath());
-        $subtaskPath = $ticketDir . '/' . $filename;
+        $subtaskPath = $ticketDir . '/' . $path;
         if (!is_file($subtaskPath)) {
             return response()->json(['error' => 'subtask_not_found', 'path' => $subtaskPath], 404);
         }
+        // Ticket dir is `<task-lists>/tasks/drafts`, so its grandparent is the
+        // task-lists root — the widest tree a ticket may legitimately link into.
+        $rootReal = realpath(dirname($ticketDir, 2));
         $real = realpath($subtaskPath);
-        $dirReal = realpath($ticketDir);
-        if ($real === false || $dirReal === false
-            || !str_starts_with($real, $dirReal . DIRECTORY_SEPARATOR)
+        if ($real === false || $rootReal === false
+            || !str_starts_with($real, $rootReal . DIRECTORY_SEPARATOR)
         ) {
             return response()->json(['error' => 'invalid_path'], 400);
         }
@@ -610,7 +619,8 @@ class TicketsController extends Controller
         }
 
         return response()->json([
-            'filename' => $filename,
+            'filename' => basename($real),
+            'path'     => $path,
             'content'  => $content,
         ]);
     }
@@ -794,6 +804,14 @@ class TicketsController extends Controller
             }
         }
         $relatedTasks = $this->findRelatedTasks($ticketId, $subtaskPaths);
+
+        // What stage each tracked coding / feature task is at — the release it
+        // shipped in, or the branch it merged to, or where it sits in the
+        // pipeline. Resolved from git for merged work (see task-stages.py), so
+        // a task list shuffled between sections cannot make this wrong.
+        $stages = app(TaskStages::class);
+        $subtasks = $stages->decorate($subtasks);
+        $relatedTasks = $stages->decorate($relatedTasks);
         $pipelineSection = $this->loadPipelineSectionMap()[ltrim($ticketId, 'Tt')] ?? null;
         $bodyHtml = null;
 
@@ -1374,6 +1392,15 @@ class TicketsController extends Controller
      * frontmatter and the `# Reply draft …` title, then de-quote the `>`-quoted
      * body block into plain paragraphs — i.e. exactly the text the customer
      * reads and the user edits in the panel.
+     *
+     * The body ENDS where the blockquote ends. Everything a draft file carries
+     * below it — `---`, `## Internal notes`, `## Knowledge gaps` — is internal
+     * working material and must never appear in the panel: the panel's text is
+     * what an operator edits and sends, so anything shown there can reach the
+     * customer. (2026-08-12: T67887's draft showed its full internal notes —
+     * reviewer feedback, source file references, tenant deployment state — in
+     * the send box.) Blank lines inside the quote block are kept so paragraph
+     * spacing survives.
      */
     private function extractDraftBodyMarkdown(string $markdown): string
     {
@@ -1386,18 +1413,55 @@ class TicketsController extends Controller
         }
         $out = [];
         $seenQuote = false;
+        $pendingBlanks = [];
         foreach (explode("\n", $text) as $line) {
             if (preg_match('/^#\s+/', $line)) {
                 continue; // drop the "# Reply draft — T…" title
             }
             if (preg_match('/^>\s?(.*)$/', $line, $m)) {
+                // A blank line only belongs to the body if the quote resumes
+                // after it — otherwise it was the gap before the internal tail.
+                foreach ($pendingBlanks as $blank) {
+                    $out[] = $blank;
+                }
+                $pendingBlanks = [];
                 $out[] = $m[1];
                 $seenQuote = true;
             } elseif ($seenQuote) {
-                $out[] = $line;
+                if (trim($line) === '') {
+                    $pendingBlanks[] = $line;
+                    continue;
+                }
+                break; // first unquoted content line ends the customer-facing body
             }
         }
-        $body = trim(implode("\n", $out));
-        return $body !== '' ? $body : $this->extractBodyMarkdown($markdown);
+        // A drafter that put its internal notes INSIDE the blockquote (it
+        // happens — T67881's second draft did) would otherwise smuggle them
+        // through the de-quoting, so the same heading rule applies here too.
+        $body = self::stripInternalTail(trim(implode("\n", $out)));
+        if ($body !== '') {
+            return $body;
+        }
+        // No blockquote in this draft (plain `## Body` convention, or a body
+        // written unquoted). Same rule still applies: nothing from an internal
+        // `## …` section may reach the panel.
+        return self::stripInternalTail($this->extractBodyMarkdown($markdown));
+    }
+
+    /**
+     * Drop everything from the first `## …` heading onward, plus a trailing
+     * horizontal rule. A customer-facing reply is prose and never carries an H2;
+     * the draft files use H2s exclusively for internal sections.
+     */
+    public static function stripInternalTail(string $body): string
+    {
+        $text = preg_replace("/\r\n|\r/", "\n", $body) ?? '';
+        if (preg_match('/^##\s+/m', $text, $m, PREG_OFFSET_CAPTURE)) {
+            $text = substr($text, 0, $m[0][1]);
+        }
+        // A draft separates the body from its internal tail with `---`; once the
+        // tail is gone the rule is a dangling artefact, not content.
+        $text = preg_replace('/\n\s*(?:-{3,}|\*{3,}|_{3,})\s*$/', '', rtrim($text)) ?? $text;
+        return trim($text);
     }
 }

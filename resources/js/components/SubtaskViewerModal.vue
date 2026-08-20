@@ -151,7 +151,7 @@ export default {
             const fetchUrl = this.url
                 || (this.ticketId && this.filename
                     ? '/api/tickets/' + encodeURIComponent(this.ticketId)
-                        + '/subtask/' + encodeURIComponent(this.filename)
+                        + '/subtask?path=' + encodeURIComponent(this.filename)
                     : '');
             if (!fetchUrl) return;
             this.loading = true;
