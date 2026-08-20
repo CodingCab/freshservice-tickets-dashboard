@@ -28,8 +28,10 @@ Route::post('/api/tickets/{id}/operator-note', [TicketsController::class, 'saveO
 // controller (rejects `/` and `..`, plus a realpath-containment check).
 Route::get('/api/tickets/{id}/attachment/{filename}', [TicketsController::class, 'attachment'])
     ->where('filename', '[^/]+');
-Route::get('/api/tickets/{id}/subtask/{filename}', [TicketsController::class, 'subtask'])
-    ->where('filename', '[A-Za-z0-9._\-]+');
+// Path comes as `?path=` (relative to the ticket file) rather than a route
+// segment: linked tasks live outside the ticket's own directory (`../x.md`),
+// which cannot be expressed in a path segment without encoded slashes.
+Route::get('/api/tickets/{id}/subtask', [TicketsController::class, 'subtask']);
 Route::get('/api/tickets/{id}/related/{taskId}', [TicketsController::class, 'relatedTask'])
     ->where('taskId', '[A-Za-z0-9._\-]+');
 

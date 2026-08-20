@@ -30,17 +30,38 @@
 
             <ticket-actions v-if="data" :data="data" @action="onAction" />
 
+            <!-- Manual Agent Request status. Collapsed to a single status line by
+                 default — the detail underneath is a long orchestrator narrative
+                 nobody needs on every open, so it is opened on demand. -->
             <div v-if="agentRequestBanner" class="agent-request-banner" :class="'agent-request-banner--' + agentRequestBanner.tone">
-                <div class="agent-request-banner__head">
+                <button
+                    type="button"
+                    class="agent-request-banner__head"
+                    :aria-expanded="agentBannerOpen ? 'true' : 'false'"
+                    @click="agentBannerOpen = !agentBannerOpen"
+                >
+                    <span class="agent-request-banner__chevron">{{ agentBannerOpen ? '▾' : '▸' }}</span>
                     <span class="agent-request-banner__badge">🤖 {{ agentRequestBanner.label }}</span>
+                    <span v-if="agentRequestBanner.activity" class="agent-request-banner__meta">
+                        {{ agentRequestBanner.activity.actor }}<template v-if="agentRequestBanner.activity.when"> · {{ agentRequestBanner.activity.when }}</template>
+                    </span>
                     <span v-if="agentRequestBanner.elapsed" class="agent-request-banner__elapsed">{{ agentRequestBanner.elapsed }}</span>
+                </button>
+
+                <div v-if="agentBannerOpen" class="agent-request-banner__body">
+                    <div v-if="agentRequestBanner.instruction" class="agent-request-banner__block">
+                        <div class="agent-request-banner__label">Instruction</div>
+                        <p class="agent-request-banner__text">{{ agentRequestBanner.instruction }}</p>
+                    </div>
+
+                    <div v-if="agentRequestBanner.activity" class="agent-request-banner__block">
+                        <div class="agent-request-banner__label">What the agent did</div>
+                        <ul class="agent-request-banner__points">
+                            <li v-for="(point, i) in agentRequestBanner.activity.points" :key="i">{{ point }}</li>
+                        </ul>
+                    </div>
+
                     <button v-if="agentRequestBanner.canRefresh" type="button" class="agent-request-banner__refresh" :disabled="loading" @click="load">↻ Refresh</button>
-                </div>
-                <div class="agent-request-banner__instruction">
-                    <strong>Instruction:</strong> {{ agentRequestBanner.instruction }}
-                </div>
-                <div v-if="agentRequestBanner.lastActivity" class="agent-request-banner__activity">
-                    <strong>Last activity:</strong> {{ agentRequestBanner.lastActivity }}
                 </div>
             </div>
 
@@ -470,19 +491,50 @@
                                 Subtasks ({{ data.subtasks.length }})
                             </button>
                             <ul v-if="subtasksOpen" class="td-subtasks">
+                                <li class="td-subtask td-subtask-head">
+                                    <span class="td-checkbox"></span>
+                                    <span class="td-col-id">TASK</span>
+                                    <span class="td-subtask-title"></span>
+                                    <span class="td-col-stage">STAGE</span>
+                                    <span class="td-col-pr">PR</span>
+                                    <span class="td-col-kind">KIND</span>
+                                    <span class="td-col-blocking"></span>
+                                    <span class="td-col-status"></span>
+                                </li>
                                 <li v-for="(s, i) in data.subtasks" :key="i" class="td-subtask">
                                     <span class="td-checkbox">{{ s.checked ? '[x]' : '[ ]' }}</span>
-                                    <span v-if="s.task_id" class="td-related-id" :title="'tracked as ' + s.task_id">{{ s.task_id }}</span>
+                                    <span class="td-col-id">
+                                        <span v-if="s.task_id" class="td-related-id" :title="'tracked as ' + s.task_id">{{ s.task_id }}</span>
+                                    </span>
                                     <a v-if="s.path" href="#" @click.prevent="openSubtask(s)" class="td-subtask-title">{{ s.title }}</a>
                                     <span v-else class="td-subtask-title">{{ s.title }}</span>
-                                    <span v-if="s.kind" class="td-badge">{{ s.kind }}</span>
-                                    <span
-                                        v-if="subtaskBlockingBadge(s)"
-                                        class="td-badge"
-                                        :class="subtaskBlockingBadge(s).cls"
-                                        :title="subtaskBlockingBadge(s).title"
-                                    >{{ subtaskBlockingBadge(s).label }}</span>
-                                    <span v-if="s.status && s.status !== 'done'" class="td-badge td-badge-status" :title="'status: ' + s.status">{{ s.status }}</span>
+                                    <span class="td-col-stage">
+                                        <span
+                                            v-if="s.stage"
+                                            class="td-stage-pill"
+                                            :class="stagePillClass(s)"
+                                            :title="stageTitle(s)"
+                                        >{{ s.stage }}</span>
+                                        <span v-else class="td-col-empty" :title="stageTitle(s)">-</span>
+                                    </span>
+                                    <span class="td-col-pr">
+                                        <a v-if="s.pr_url" :href="s.pr_url" target="_blank" rel="noopener" class="td-pr-link">#{{ s.pr }}</a>
+                                        <span v-else class="td-col-empty">-</span>
+                                    </span>
+                                    <span class="td-col-kind">
+                                        <span v-if="s.kind" class="td-badge">{{ s.kind }}</span>
+                                    </span>
+                                    <span class="td-col-blocking">
+                                        <span
+                                            v-if="subtaskBlockingBadge(s)"
+                                            class="td-badge"
+                                            :class="subtaskBlockingBadge(s).cls"
+                                            :title="subtaskBlockingBadge(s).title"
+                                        >{{ subtaskBlockingBadge(s).label }}</span>
+                                    </span>
+                                    <span class="td-col-status">
+                                        <span v-if="s.status && s.status !== 'done'" class="td-badge td-badge-status" :title="'status: ' + s.status">{{ s.status }}</span>
+                                    </span>
                                 </li>
                             </ul>
                         </div>
@@ -498,17 +550,45 @@
                                 Related tasks ({{ data.related_tasks.length }})
                             </button>
                             <ul v-if="relatedTasksOpen" class="td-related-tasks">
+                                <li class="td-related-task td-subtask-head">
+                                    <span class="td-checkbox"></span>
+                                    <span class="td-col-id">TASK</span>
+                                    <span class="td-related-title"></span>
+                                    <span class="td-col-stage">STAGE</span>
+                                    <span class="td-col-pr">PR</span>
+                                    <span class="td-col-list">LIST</span>
+                                    <span class="td-col-status"></span>
+                                </li>
                                 <li v-for="t in data.related_tasks" :key="t.task_id + '-' + t.list" class="td-related-task">
                                     <span class="td-checkbox">{{ t.checked ? '[x]' : '[ ]' }}</span>
-                                    <span class="td-related-id">{{ t.task_id }}</span>
+                                    <span class="td-col-id">
+                                        <span class="td-related-id">{{ t.task_id }}</span>
+                                    </span>
                                     <a v-if="t.task_id" href="#" @click.prevent="openRelated(t)" class="td-related-title td-related-title-link">{{ t.title }}</a>
                                     <span v-else class="td-related-title">{{ t.title }}</span>
-                                    <span class="td-badge td-related-list" :title="t.list + ' — ' + t.section">
-                                        <span class="td-related-list-name">{{ t.list }}</span>
-                                        <span class="td-related-list-sep"> · </span>
-                                        <span class="td-related-list-section">{{ t.section }}</span>
+                                    <span class="td-col-stage">
+                                        <span
+                                            v-if="t.stage"
+                                            class="td-stage-pill"
+                                            :class="stagePillClass(t)"
+                                            :title="stageTitle(t)"
+                                        >{{ t.stage }}</span>
+                                        <span v-else class="td-col-empty" :title="stageTitle(t)">-</span>
                                     </span>
-                                    <span v-if="t.status_marker" class="td-badge td-badge-status">{{ t.status_marker }}</span>
+                                    <span class="td-col-pr">
+                                        <a v-if="t.pr_url" :href="t.pr_url" target="_blank" rel="noopener" class="td-pr-link">#{{ t.pr }}</a>
+                                        <span v-else class="td-col-empty">-</span>
+                                    </span>
+                                    <span class="td-col-list">
+                                        <span class="td-badge td-related-list" :title="t.list + ' — ' + t.section">
+                                            <span class="td-related-list-name">{{ t.list }}</span>
+                                            <span class="td-related-list-sep"> · </span>
+                                            <span class="td-related-list-section">{{ t.section }}</span>
+                                        </span>
+                                    </span>
+                                    <span class="td-col-status">
+                                        <span v-if="t.status_marker" class="td-badge td-badge-status">{{ t.status_marker }}</span>
+                                    </span>
                                 </li>
                             </ul>
                         </div>
@@ -663,6 +743,7 @@ export default {
             error: '',
             data: null,
             timelineOpen: false,
+            agentBannerOpen: false,  // the agent-request detail opens on demand
             rejectModalOpen: false,
             sendModalOpen: false,
             splitModalOpen: false,
@@ -833,6 +914,7 @@ export default {
                     break;
                 }
             }
+            const activity = this.parseAgentActivity(lastActivity);
 
             // Elapsed since the request was added (only show while in flight).
             let elapsed = '';
@@ -850,16 +932,22 @@ export default {
                 }
             }
 
+            // A bare status marker (`_(addressed in this draft)_`) says nothing
+            // the badge doesn't already say — only a real operator instruction
+            // is worth its own block.
             const fullInstruction = m ? m[1].trim() : raw;
+            const operatorInstruction = fullInstruction.startsWith('_(')
+                ? ''
+                : (fullInstruction.length > 600 ? fullInstruction.slice(0, 600) + '…' : fullInstruction);
+
             return {
                 label,
                 tone,
                 canRefresh,
                 elapsed,
-                instruction: fullInstruction.length > 240
-                    ? fullInstruction.slice(0, 240) + '…'
-                    : fullInstruction,
+                instruction: operatorInstruction,
                 lastActivity,
+                activity,
             };
         },
         /* True while the banner is in an active phase (queued / drafting),
@@ -1123,6 +1211,26 @@ export default {
                 /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?\s*(?:UTC|Z)/gi,
                 (stamp) => L.format(stamp)
             );
+        },
+        /* Split a Manual-Agent-Request timeline line into something readable:
+           when it happened, who did it, and the narrative as separate points.
+           The stored line is one long paragraph — sentences are the only
+           structure it has, so they become the bullets. Splitting requires
+           whitespace after the full stop, which keeps version and path refs
+           (64.0.1, origin/64.0.1) in one piece. Returns null when there is no
+           activity line at all. */
+        parseAgentActivity(line) {
+            if (!line) return null;
+            const text = String(line).trim();
+            const m = text.match(/^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:\s+[A-Za-z]{2,5})?)?\s*(\S+)\s+-\s+([\s\S]+)$/);
+            const when = (m && m[1]) ? m[1].trim() : '';
+            const actor = (m && m[2]) ? m[2].trim() : 'agent';
+            const body = (m && m[3]) ? m[3].trim() : text;
+            const points = body
+                .split(/(?<=[.;])\s+(?=[A-Z0-9`(])/)
+                .map((s) => s.trim())
+                .filter(Boolean);
+            return { when, actor, points: points.length ? points : [body] };
         },
         /* One timeline row: the stamp shown in the viewer's zone, the stored
            UTC kept for the hover tooltip, and the action text. */
@@ -1646,6 +1754,32 @@ export default {
          *   - blocks_reply:true + open → orange "blocks reply" (action needed)
          *   - blocks_reply:true + done → no badge (the [x] checkbox says it all)
          */
+        /**
+         * Colour for the STAGE pill, by what the stage actually means:
+         *   released → green   (it is in a cut release; the number is the release)
+         *   branch   → purple  (merged, but only onto a long-lived branch — some
+         *                       tenants run those directly, so it is NOT "not done")
+         *   section  → blue    (still moving through the pipeline)
+         */
+        stagePillClass(s) {
+            const kind = (s && s.stage_kind) || '';
+            if (kind === 'released') return 'td-stage-pill-released';
+            if (kind === 'branch') return 'td-stage-pill-branch';
+            return 'td-stage-pill-section';
+        },
+        /** Tooltip spelling out where the stage came from, including "nowhere". */
+        stageTitle(s) {
+            if (!s || !s.task_id) return 'not a tracked coding task';
+            if (!s.stage) return s.task_id + ' is not on any task list and has no merged change';
+            if (s.stage_kind === 'released') {
+                return s.task_id + ' shipped in release ' + (s.release || s.stage)
+                    + (s.merged_at ? ' (merged ' + s.merged_at + ')' : '');
+            }
+            if (s.stage_kind === 'branch') {
+                return s.task_id + ' is merged into ' + s.branch + ', not in a release yet';
+            }
+            return s.task_id + ': ' + s.stage;
+        },
         subtaskBlockingBadge(s) {
             if (!s || s.blocks_reply === undefined) return null;
             if (s.blocks_reply === false) {
@@ -1656,7 +1790,9 @@ export default {
         },
         openSubtask(s) {
             if (!s || !s.path) return;
-            // s.path is `./FILENAME.md` (or `FILENAME.md`). Strip leading `./`.
+            // s.path is relative to the ticket file: `./FILENAME.md` for a
+            // spawned subtask, `../FILENAME.md` for a linked tracked task.
+            // Only the redundant leading `./` is stripped — `../` must survive.
             const filename = String(s.path).replace(/^\.\//, '');
             this.subtaskModalFilename = filename;
             this.subtaskModalTitle = s.title || '';
@@ -2663,7 +2799,59 @@ export default {
     color: #58a6ff;
     text-decoration: none;
     flex: 1;
+    min-width: 0;
 }
+/* Fixed columns: every piece of information always sits in the same place, and
+   an empty one stays empty rather than letting the row shift. Each column also
+   LOOKS different — a coloured pill, a plain link, a grey chip — so two chips
+   side by side can never be confused for one another. */
+.td-col-id {
+    flex: 0 0 58px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+}
+.td-col-stage    { flex: 0 0 152px; text-align: right; }
+.td-col-pr       { flex: 0 0 52px;  text-align: right; }
+.td-col-kind     { flex: 0 0 96px;  text-align: right; }
+.td-col-blocking { flex: 0 0 92px;  text-align: right; }
+.td-col-status   { flex: 0 0 72px;  text-align: right; }
+.td-col-list     { flex: 0 0 200px; text-align: right; overflow: hidden; }
+/* On a narrow screen the columns would have to give up either their width or
+   their alignment. They give up neither: the list scrolls sideways instead, so
+   a phone shows the same table, just a window onto it. */
+.td-subtasks, .td-related-tasks { overflow-x: auto; }
+.td-subtask, .td-related-task { min-width: 620px; }
+.td-col-empty    { color: #484f58; }
+.td-subtask-head {
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    color: #6e7681;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 3px;
+}
+.td-stage-pill {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+    border-radius: 4px;
+    padding: 1px 7px;
+    font-size: 11px;
+    font-weight: 600;
+    border: 1px solid transparent;
+}
+.td-stage-pill-released { background: #12261a; color: #4ac26b; border-color: #2ea04355; }
+.td-stage-pill-branch   { background: #221830; color: #c297ff; border-color: #8957e555; }
+.td-stage-pill-section  { background: #1a2a4d; color: #79c0ff; border-color: #1f6feb55; }
+.td-pr-link {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #8b949e;
+    text-decoration: none;
+}
+.td-pr-link:hover { color: #58a6ff; text-decoration: underline; }
 .td-subtask-title:hover { text-decoration: underline; }
 .td-badge {
     background: #21262d;
@@ -2704,7 +2892,8 @@ export default {
     border-bottom: 1px dashed #21262d;
     font-size: 12.5px;
     line-height: 1.4;
-    flex-wrap: wrap;
+    /* No wrapping: the columns only stay columns while every row is one line. */
+    flex-wrap: nowrap;
 }
 .td-related-task:last-child { border-bottom: 0; }
 .td-related-id {
@@ -2845,7 +3034,54 @@ export default {
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-bottom: 6px;
+    width: 100%;
+    padding: 0;
+    background: transparent;
+    border: 0;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+.agent-request-banner__chevron {
+    color: #8b949e;
+    font-size: 11px;
+    width: 10px;
+}
+.agent-request-banner__meta {
+    font-size: 12px;
+    color: #8b949e;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.agent-request-banner__body {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid #30363d;
+}
+.agent-request-banner__block + .agent-request-banner__block {
+    margin-top: 10px;
+}
+.agent-request-banner__label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #8b949e;
+    margin-bottom: 4px;
+}
+.agent-request-banner__text {
+    margin: 0;
+    color: #c9d1d9;
+}
+.agent-request-banner__points {
+    margin: 0;
+    padding-left: 18px;
+    color: #c9d1d9;
+}
+.agent-request-banner__points li + li {
+    margin-top: 4px;
 }
 .agent-request-banner__badge {
     font-weight: 600;
@@ -2860,7 +3096,7 @@ export default {
     color: #8b949e;
 }
 .agent-request-banner__refresh {
-    margin-left: auto;
+    margin-top: 10px;
     background: transparent;
     color: #8b949e;
     border: 1px solid #30363d;
