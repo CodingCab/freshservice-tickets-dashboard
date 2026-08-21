@@ -7,6 +7,8 @@ const TICKETS_API = BASE_URL + '/api/tickets';
 const AGENTS_API = BASE_URL + '/api/agents';
 const FS_HEALTH_API = BASE_URL + '/api/health/freshservice';
 const AI_SESSIONS_API = BASE_URL + '/api/ai-sessions';
+const PIPELINE_PAGE = BASE_URL + '/pipeline-metrics';
+const PIPELINE_STATUS_API = BASE_URL + '/api/pipeline-metrics/status';
 // window.taskListsTabHTML / window.loadTaskLists / window.mountTaskListsApp
 // are provided by the Vite-built Vue bundle (resources/js/app.js).
 
@@ -19,6 +21,12 @@ let currentFilter = 'active';
 let currentSort = 'category';
 let sortDir = 1;
 let currentTab = 'tickets';
+// The Pipeline tab shows an hourly snapshot produced outside this app, so it is loaded
+// once, when the tab is first opened, rather than on page load or on the thirty-second
+// refresh the ticket data needs. Declared up here with the other page state because the
+// hash router can switch to that tab before the file has finished evaluating, and a `let`
+// declared further down is unreachable at that moment — which left the frame blank.
+let pipelineLoaded = false;
 let showStarredOnly = false;
 
 // ─── Modal stack ──────────────────────────────────────────────────
@@ -822,6 +830,7 @@ function renderApp() {
             <button class="page-tab" data-page="task-lists" onclick="switchTab('task-lists')">Task Lists</button>
             <button class="page-tab" data-page="feedback" onclick="switchTab('feedback')">Feedback</button>
             <button class="page-tab" data-page="ai-sessions" onclick="switchTab('ai-sessions')">AI Sessions</button>
+            <button class="page-tab" data-page="pipeline" onclick="switchTab('pipeline')">Pipeline</button>
         </div>
 
         <div id="tickets-tab" class="tab-page">
@@ -957,6 +966,17 @@ function renderApp() {
             <div id="feedbackContainer"><p class="feedback-empty">Loading…</p></div>
         </div>
 
+        <div id="pipeline-tab" class="tab-page" style="display:none;">
+            <div class="header">
+                <h1>Pipeline</h1>
+                <button class="refresh-btn" onclick="loadPipeline(true)">&#x21bb; Refresh</button>
+                <a href="${PIPELINE_PAGE}" target="_blank" class="json-link">Open alone</a>
+                <span class="last-updated" id="pipelineLastSynced"></span>
+            </div>
+            <p class="feedback-intro">Every step of the developer pipeline: how often each step's work had to be done again, what one run of it costs, and where the defects come from. This page is a snapshot written hourly, so it lags the live figures by up to an hour — the time above is when it was written, not when you opened it.</p>
+            <iframe id="pipelineFrame" title="Pipeline metrics" style="width:100%;height:calc(100vh - 230px);min-height:520px;border:1px solid #2c2c2a;border-radius:6px;background:#141414;"></iframe>
+        </div>
+
         <div id="ai-sessions-tab" class="tab-page" style="display:none;">
             <div class="header">
                 <h1>AI Sessions</h1>
@@ -1071,10 +1091,13 @@ function switchTab(tab, updateHash = true) {
     if (fbTab) fbTab.style.display = tab === 'feedback' ? '' : 'none';
     const aiTab = document.getElementById('ai-sessions-tab');
     if (aiTab) aiTab.style.display = tab === 'ai-sessions' ? '' : 'none';
+    const pipelineTab = document.getElementById('pipeline-tab');
+    if (pipelineTab) pipelineTab.style.display = tab === 'pipeline' ? '' : 'none';
     if (tab === 'agents' && agentTasks.length === 0) loadAgents();
     if (tab === 'task-lists') loadTaskLists();
     if (tab === 'feedback') loadFeedback();
     if (tab === 'ai-sessions') loadAiSessions();
+    if (tab === 'pipeline') loadPipeline();
     if (updateHash) window.location.hash = tab === 'tickets' ? '' : tab;
 }
 
@@ -1751,7 +1774,7 @@ loadUiPrefs();   // restore the operator's toolbar choices before the first rend
 renderApp();
 applyUiPrefs();  // reflect the restored status filter / starred / sort on the buttons
 
-const VALID_TABS = ['tickets', 'agents', 'task-lists', 'feedback', 'ai-sessions'];
+const VALID_TABS = ['tickets', 'agents', 'task-lists', 'feedback', 'ai-sessions', 'pipeline'];
 const initialTab = window.location.hash.replace('#', '') || 'tickets';
 if (VALID_TABS.includes(initialTab)) switchTab(initialTab, false);
 window.addEventListener('hashchange', () => {
@@ -1771,6 +1794,29 @@ setInterval(() => {
     else if (currentTab === 'task-lists') loadTaskLists();
     else if (currentTab === 'ai-sessions') loadAiSessions();
 }, 30 * 1000);
+
+// ─── Pipeline ───────────────────────────────────────────────────
+
+async function loadPipeline(force = false) {
+    const frame = document.getElementById('pipelineFrame');
+    if (!frame) return;
+    if (!pipelineLoaded || force) {
+        frame.src = PIPELINE_PAGE + '?t=' + Date.now();
+        pipelineLoaded = true;
+    }
+    try {
+        const resp = await fetch(PIPELINE_STATUS_API + '?t=' + Date.now());
+        const status = await resp.json();
+        const label = document.getElementById('pipelineLastSynced');
+        if (!label) return;
+        label.textContent = status.available
+            ? 'Snapshot written: ' + status.written_at
+            : 'No snapshot written yet';
+    } catch (e) {
+        const label = document.getElementById('pipelineLastSynced');
+        if (label) label.textContent = 'Could not read when the snapshot was written';
+    }
+}
 
 // ─── AI Sessions ────────────────────────────────────────────────
 
