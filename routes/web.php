@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\LabelController;
 use App\Http\Controllers\TicketActionController;
+use App\Http\Controllers\PipelineMetricsController;
 use App\Http\Controllers\TicketsController;
 use Illuminate\Support\Facades\Route;
 
@@ -13,6 +14,11 @@ Route::get('/api/labels', [LabelController::class, 'index']);
 Route::post('/api/labels', [LabelController::class, 'store']);
 Route::delete('/api/labels/{id}', [LabelController::class, 'destroy'])->where('id', '[0-9]+');
 Route::post('/api/tickets/{id}/labels', [LabelController::class, 'assign']);
+// The pipeline metrics tab. The page is an hourly snapshot produced elsewhere; this only
+// hands it over, so there is one implementation of those numbers rather than two.
+Route::get('/pipeline-metrics', [PipelineMetricsController::class, 'show']);
+Route::get('/api/pipeline-metrics/status', [PipelineMetricsController::class, 'status']);
+
 Route::get('/api/health/freshservice', [TicketsController::class, 'health']);
 Route::get('/api/agents', [TicketsController::class, 'agents']);
 Route::get('/api/ai-sessions', [TicketsController::class, 'aiSessions']);
