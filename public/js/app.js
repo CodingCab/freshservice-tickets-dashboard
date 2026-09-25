@@ -2176,7 +2176,8 @@ document.addEventListener('keydown', e => {
 // agent job). Two small multiples on a shared 0–100% scale: the 5-hour
 // session window and the 7-day weekly window.
 
-let usageData = {};          // user -> [{ts, five_hour, seven_day, ...}]
+let usageData = {};          // user -> [{ts, five_hour, seven_day, stale, ...}]
+let usageStatus = {};        // user -> {entries, stale, no_data, last_error, last_ts}
 const USAGE_API = BASE_URL + '/api/agents/usage';
 
 // The usage charts have their own range, independent of the table's filter:
@@ -2215,8 +2216,10 @@ async function loadUsage() {
             '&since=' + encodeURIComponent(new Date(t0).toISOString()));
         const data = await resp.json();
         usageData = data.users || {};
+        usageStatus = data.status || {};
     } catch (e) {
         usageData = {};
+        usageStatus = {};
     }
     renderUsageCharts();
 }
@@ -2234,7 +2237,9 @@ function usageTimeDomain() {
 function usageBucketize(pts, field, t0, bucketMs) {
     const buckets = new Map();
     for (const pt of pts) {
-        if (pt[field] == null) continue;
+        // A replayed cache (fetched long before the snapshot) is not a reading:
+        // never drawn, so a flat line can only mean a genuinely flat limit.
+        if (pt.stale || pt[field] == null) continue;
         const idx = Math.floor((Date.parse(pt.ts) - t0) / bucketMs);
         if (idx < 0) continue;
         const cur = buckets.get(idx);
@@ -2300,9 +2305,19 @@ function renderUsageLegend() {
     const el = document.getElementById('usageLegend');
     if (!el) return;
     const users = usageVisibleUsers();
-    el.innerHTML = users.map(u =>
-        `<span class="usage-key"><span class="usage-chip" style="background:${usageColor(u)}"></span>${esc(u)}</span>`
-    ).join('');
+    el.innerHTML = users.map(u => {
+        const st = usageStatus[u];
+        if (!st || !st.no_data) {
+            return `<span class="usage-key"><span class="usage-chip" style="background:${usageColor(u)}"></span>${esc(u)}</span>`;
+        }
+        // An account that logged snapshots but has no fresh reading: say so, and why,
+        // instead of leaving it off the chart as if it had been idle.
+        const reason = st.last_error || (st.stale ? 'only stale snapshots' : 'no value recorded');
+        const since = st.last_ts ? ' · last ' + new Date(st.last_ts).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
+        return `<span class="usage-key usage-key-nodata" title="${esc(reason + since)}">` +
+            `<span class="usage-chip" style="background:${usageColor(u)}"></span>${esc(u)}` +
+            ` <span class="usage-nodata">no data — ${esc(reason)}</span></span>`;
+    }).join('');
 }
 
 function renderUsageChart(elId, field) {
