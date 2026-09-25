@@ -124,7 +124,7 @@ class AgentUsageApiTest extends TestCase
         $this->assertSame([], $response->json()['users']);
     }
 
-    // ── B0026: stale snapshots are never plotted, accounts without data are surfaced ──
+    // ── Stale snapshots are never plotted, accounts without data are surfaced ──
 
     /** A point taken at $ts whose data was fetched $ageSeconds before $ts. */
     private function snapshot(string $ts, int $ageSeconds, int $fiveHour, int $sevenDay, array $extra = []): array

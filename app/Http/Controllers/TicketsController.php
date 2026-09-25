@@ -12,6 +12,13 @@ use Symfony\Component\Process\Process;
 class TicketsController extends Controller
 {
     /**
+     * The logger caches an account's utilization for this long before it fetches a
+     * live value again; a snapshot whose data was fetched further back than this
+     * before the snapshot's own time is a replayed cache, not a reading.
+     */
+    private const USAGE_SNAPSHOT_WINDOW_S = 30 * 60;
+
+    /**
      * Return the path to the tickets database JSON file.
      * Defaults to the shared cron location; override via TICKETS_DB_PATH env var.
      */
@@ -456,13 +463,6 @@ class TicketsController extends Controller
      * Each entry snapshots the account's cached limit utilization: five-hour
      * and seven-day window percentages plus reset times.
      */
-    /**
-     * The logger caches an account's utilization for this long before it fetches a
-     * live value again; a snapshot whose data was fetched further back than this
-     * before the snapshot's own time is a replayed cache, not a reading.
-     */
-    private const USAGE_SNAPSHOT_WINDOW_S = 30 * 60;
-
     public function agentUsage(Request $request)
     {
         $since = $request->query('since');
