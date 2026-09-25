@@ -456,6 +456,13 @@ class TicketsController extends Controller
      * Each entry snapshots the account's cached limit utilization: five-hour
      * and seven-day window percentages plus reset times.
      */
+    /**
+     * The logger caches an account's utilization for this long before it fetches a
+     * live value again; a snapshot whose data was fetched further back than this
+     * before the snapshot's own time is a replayed cache, not a reading.
+     */
+    private const USAGE_SNAPSHOT_WINDOW_S = 30 * 60;
+
     public function agentUsage(Request $request)
     {
         $since = $request->query('since');
@@ -464,11 +471,17 @@ class TicketsController extends Controller
         $untilTs = $until ? strtotime($until) : null;
 
         $users = [];
+        $status = [];
         $dir = config('dashboard.agent_usage_dir') ?: '/shared/logs/agent-usage';
         foreach (glob($dir . '/*.jsonl') ?: [] as $file) {
             if (!is_readable($file)) continue;
             $user = basename($file, '.jsonl');
             $points = [];
+            $entries = 0;
+            $stale = 0;
+            $fresh = 0;
+            $lastTs = null;
+            $lastError = null;
             $fh = fopen($file, 'r');
             if (!$fh) continue;
             while (($line = fgets($fh)) !== false) {
@@ -478,26 +491,47 @@ class TicketsController extends Controller
                 if ($ts === false) continue;
                 if ($sinceTs && $ts < $sinceTs) continue;
                 if ($untilTs && $ts > $untilTs) continue;
+                $entries++;
+                if ($lastTs === null || $ts >= $lastTs) {
+                    $lastTs = $ts;
+                    $lastError = isset($e['error']) && is_string($e['error']) && $e['error'] !== '' ? $e['error'] : null;
+                }
                 $u = $e['utilization'] ?? null;
                 if (!is_array($u)) continue;
+                $fetchedAtMs = $e['fetched_at_ms'] ?? null;
+                // A cached value older than the logger's own window, written as if it were
+                // taken at $ts, is a replay: flagged so it is never plotted as a reading.
+                $isStale = is_numeric($fetchedAtMs) && ($fetchedAtMs / 1000) < ($ts - self::USAGE_SNAPSHOT_WINDOW_S);
+                if ($isStale) $stale++;
+                else $fresh++;
                 $points[] = [
                     'ts' => gmdate('c', $ts),
                     'five_hour' => $u['five_hour']['utilization'] ?? null,
                     'seven_day' => $u['seven_day']['utilization'] ?? null,
                     'five_hour_resets_at' => $u['five_hour']['resets_at'] ?? null,
                     'seven_day_resets_at' => $u['seven_day']['resets_at'] ?? null,
-                    'fetched_at_ms' => $e['fetched_at_ms'] ?? null,
+                    'fetched_at_ms' => $fetchedAtMs,
                     'task_id' => $e['task_id'] ?? null,
+                    'stale' => $isStale,
                 ];
             }
             fclose($fh);
-            if ($points) {
-                usort($points, fn($a, $b) => strcmp($a['ts'], $b['ts']));
-                $users[$user] = $points;
-            }
+            if ($entries === 0) continue;
+            usort($points, fn($a, $b) => strcmp($a['ts'], $b['ts']));
+            // An account that logged snapshots but has no fresh reading is still listed,
+            // marked no_data with the last recorded reason, instead of silently vanishing.
+            $users[$user] = $points;
+            $status[$user] = [
+                'entries' => $entries,
+                'stale' => $stale,
+                'no_data' => $fresh === 0,
+                'last_error' => $lastError,
+                'last_ts' => gmdate('c', $lastTs),
+            ];
         }
         ksort($users);
-        return response()->json(['users' => $users]);
+        ksort($status);
+        return response()->json(['users' => $users, 'status' => $status]);
     }
 
     /**
