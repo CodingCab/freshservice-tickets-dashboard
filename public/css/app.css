@@ -482,6 +482,9 @@ tr.row-selected:hover td { background: #1b3050; }
 .usage-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-left: auto; }
 .usage-key { font-size: 0.72em; color: #c9d1d9; display: inline-flex; align-items: center; gap: 5px; }
 .usage-chip { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+.usage-key-nodata { flex: none; }
+.usage-key-nodata .usage-chip { opacity: 0.35; }
+.usage-nodata { color: #8b949e; font-style: italic; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .usage-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 900px) { .usage-charts { grid-template-columns: 1fr; } }
 .usage-chart { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px 4px; min-width: 0; }
